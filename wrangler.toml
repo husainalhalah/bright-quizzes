@@ -1,14 +1,14 @@
 name = "bright-quizzes"
-main = "main/Worker.js"
+main = "src/Worker.js"
 compatibility_date = "2026-09-01"
 
-# ربط D1 Database
+
 [[d1_databases]]
 binding = "DB"
 database_name = "bright-quizzes-db"
 database_id = "70e97a99-6464-4ad0-8018-1fc7cb0d267c"
 
-# ربط KV Namespace
+
 [[kv_namespaces]]
 binding = "IMAGES"
 id = "f282838bf9364a40a34743ed49899a84"
