@@ -1,5 +1,5 @@
 name = "bright-quizzes"
-main = "src/Worker.js"
+main = "Worker.js"
 compatibility_date = "2026-09-01"
 
 
