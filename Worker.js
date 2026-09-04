@@ -1,8 +1,14 @@
+/**
+ * ================================================================
+ *  Bright Quizzes API - Cloudflare Worker
+ *  النسخة المحدثة: معمارية نظيفة خالية من المعرفات المركبة
+ * ================================================================
+ */
+
 // ================================================================
-//  PART 1: HELPERS, AUTH & USER HANDLERS (المساعدات العامة)
+//  PART 1: المساعدات العامة ودوال التشفير والتوثيق
 // ================================================================
 
-// ===== المساعدات =====
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
@@ -30,14 +36,22 @@ function successResponse(data) {
 function getAuthToken(request) {
   const auth = request.headers.get('Authorization');
   if (!auth) return null;
-  return auth.replace('Bearer ', '');
+  return auth.replace(/^Bearer\s+/i, '');
 }
 
-// ================================================================
-//  ✅ التعديل 1: دوال تجزئة كلمات المرور (PBKDF2 عبر Web Crypto)
-// ================================================================
+// ✅ تحويل آمن للبايتات إلى Base64 بدون التسبب بـ RangeError
+function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  const chunkSize = 8192;
+  for (let i = 0; i < len; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, len)));
+  }
+  return btoa(binary);
+}
 
-// ===== تجزئة كلمات المرور (PBKDF2 عبر Web Crypto – بدون مكتبات خارجية) =====
+// ===== تجزئة كلمات المرور (PBKDF2 عبر Web Crypto) =====
 async function hashPassword(password, saltHex) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
@@ -68,7 +82,6 @@ function hexToBytes(hex) {
   return bytes;
 }
 
-// مقارنة آمنة (ثابتة الزمن)
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
   let diff = 0;
@@ -78,22 +91,13 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-// ================================================================
-//  ✅ التعديل 2: التحقق من صحة البريد الإلكتروني
-// ================================================================
-
 function isValidEmail(email) {
   const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return re.test(String(email).toLowerCase());
 }
 
-// ================================================================
-//  ✅ التعديل 3: Rate Limiting (KV)
-// ================================================================
-
 async function checkRateLimit(env, key, limit = 5, windowSeconds = 300) {
-  // 5 محاولات لكل 5 دقائق
-  if (!env.RATE_LIMIT) return true; // يسمح بالمرور إذا كان KV غير موجود (للتطوير)
+  if (!env.RATE_LIMIT) return true;
   const current = await env.RATE_LIMIT.get(key);
   const count = current ? parseInt(current, 10) : 0;
   if (count >= limit) return false;
@@ -101,7 +105,6 @@ async function checkRateLimit(env, key, limit = 5, windowSeconds = 300) {
   return true;
 }
 
-// ===== توليد التوكن =====
 function generateToken() {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
@@ -121,10 +124,7 @@ async function getImage(env, key) {
   return await env.IMAGES.get(key);
 }
 
-// ================================================================
-//  ✅ التعديل 4: التحقق من التوكن مع استبعاد المستخدمين المحذوفين وانتهاء الصلاحية
-// ================================================================
-
+// ===== التحقق من التوكن =====
 async function verifyToken(token, env) {
   if (!token) return null;
   try {
@@ -135,15 +135,14 @@ async function verifyToken(token, env) {
        AND (deleted_at IS NULL OR deleted_at = "")
        AND (token_expires_at IS NULL OR token_expires_at > datetime('now'))`
     ).bind(token);
-    const result = await stmt.first();
-    return result || null;
+    return await stmt.first();
   } catch (e) {
     return null;
   }
 }
 
 // ================================================================
-//  ✅ التعديل 5: تسجيل الدخول (مع PBKDF2 + Rate Limit + Token Expiry)
+//  PART 2: المستخدمون وإدارة الجلسات
 // ================================================================
 
 async function handleUserLogin(request, env) {
@@ -152,13 +151,11 @@ async function handleUserLogin(request, env) {
     const { username, password } = body;
     if (!username || !password) return errorResponse('اسم المستخدم وكلمة المرور مطلوبان');
 
-    // ✅ التحقق من Rate Limit
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     const rlKey = `login:${ip}:${username}`;
     const allowed = await checkRateLimit(env, rlKey, 5, 300);
     if (!allowed) return errorResponse('محاولات كثيرة جداً، حاول مرة أخرى بعد قليل', 429);
 
-    // ✅ جلب المستخدم (بدون مقارنة كلمة المرور في الاستعلام)
     const stmt = await env.DB.prepare(
       'SELECT * FROM users WHERE username = ? AND (deleted_at IS NULL OR deleted_at = "")'
     ).bind(username);
@@ -166,15 +163,11 @@ async function handleUserLogin(request, env) {
 
     if (!user) return errorResponse('اسم المستخدم أو كلمة المرور غير صحيحة', 401);
 
-    // ✅ التحقق من كلمة المرور (تدعم كلاً من النظام القديم والجديد)
     let valid = false;
-
     if (user.password_hash && user.password_salt) {
-      // مستخدم جديد (كلمة مرور مجزأة)
       const computed = await hashPassword(password, user.password_salt);
       valid = safeEqual(computed, user.password_hash);
     } else if (user.password) {
-      // مستخدم قديم (نص عادي) – تحقق ثم هاجر تلقائياً
       valid = safeEqual(password, user.password);
       if (valid) {
         const salt = generateSalt();
@@ -187,19 +180,18 @@ async function handleUserLogin(request, env) {
 
     if (!valid) return errorResponse('اسم المستخدم أو كلمة المرور غير صحيحة', 401);
 
-    // ✅ إنشاء التوكن مع تاريخ انتهاء (30 يوماً)
     const token = generateToken();
     await env.DB.prepare(
       "UPDATE users SET token = ?, token_expires_at = datetime('now', '+30 days') WHERE id = ?"
     ).bind(token, user.id).run();
 
-    // ✅ مسح عداد Rate Limit عند نجاح تسجيل الدخول
     if (env.RATE_LIMIT) {
       await env.RATE_LIMIT.delete(rlKey).catch(() => {});
     }
 
     return successResponse({
       token,
+      refreshToken: token,
       user: {
         id: user.id,
         username: user.username,
@@ -219,10 +211,6 @@ async function handleUserLogin(request, env) {
   }
 }
 
-// ================================================================
-//  ✅ التعديل 6: إنشاء حساب (مع PBKDF2 + Email Validation)
-// ================================================================
-
 async function handleUserSignup(request, env) {
   try {
     const body = await request.json();
@@ -232,7 +220,6 @@ async function handleUserSignup(request, env) {
       return errorResponse('جميع الحقول المطلوبة يجب تعبئتها');
     }
 
-    // ✅ التحقق من صحة البريد الإلكتروني
     if (!isValidEmail(email)) {
       return errorResponse('البريد الإلكتروني غير صحيح');
     }
@@ -243,7 +230,6 @@ async function handleUserSignup(request, env) {
     const existing = await check.first();
     if (existing) return errorResponse('اسم المستخدم أو البريد الإلكتروني مستخدم بالفعل');
 
-    // ✅ تجزئة كلمة المرور
     const salt = generateSalt();
     const passwordHash = await hashPassword(password, salt);
     const token = generateToken();
@@ -257,17 +243,23 @@ async function handleUserSignup(request, env) {
     );
 
     await stmt.run();
+    const lastRow = await env.DB.prepare('SELECT last_insert_rowid() as id').first();
 
     return successResponse({
       token,
+      refreshToken: token,
       user: {
-        username, full_name, email,
+        id: lastRow ? lastRow.id : null,
+        username,
+        full_name,
+        email,
         badge: 'none',
         governorate: governorate || null,
         school: school || null,
         age: age || null,
         avatar: null,
-        is_admin: false
+        is_admin: false,
+        created_at: new Date().toISOString()
       }
     });
   } catch (e) {
@@ -275,7 +267,6 @@ async function handleUserSignup(request, env) {
   }
 }
 
-// ===== 3. جلب بيانات المستخدم الحالي =====
 async function handleUserMe(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -298,7 +289,6 @@ async function handleUserMe(request, env) {
   });
 }
 
-// ===== 4. جلب بروفايل مستخدم آخر (عام) مع is_admin =====
 async function handleUserProfileById(request, env) {
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
@@ -308,46 +298,44 @@ async function handleUserProfileById(request, env) {
 
   try {
     let query = 'SELECT id, username, full_name, badge, governorate, school, age, avatar, is_admin, created_at FROM users WHERE (deleted_at IS NULL OR deleted_at = "")';
-    let param;
-    if (id) {
-      query += ' AND id = ?';
-      param = parseInt(id);
-    } else {
-      query += ' AND username = ?';
-      param = username;
-    }
+    let param = id ? parseInt(id, 10) : username;
+    query += id ? ' AND id = ?' : ' AND username = ?';
+
     const stmt = await env.DB.prepare(query).bind(param);
     const user = await stmt.first();
-
     if (!user) return errorResponse('المستخدم غير موجود', 404);
 
-    const stats = {
-      total_answers: 0,
-      accuracy: 0,
-      categories: []
-    };
+    const statsStmt = await env.DB.prepare(`
+      SELECT 
+        COUNT(*) as total_answers,
+        COALESCE(AVG(percentage), 0) as avg_accuracy,
+        COALESCE(SUM(score), 0) as total_score
+      FROM results WHERE user_id = ?
+    `).bind(user.id);
+    const statsResult = await statsStmt.first();
 
-    const followersStmt = await env.DB.prepare(
-      'SELECT COUNT(*) as count FROM follows WHERE following_id = ?'
-    ).bind(user.id);
+    const followersStmt = await env.DB.prepare('SELECT COUNT(*) as count FROM follows WHERE following_id = ?').bind(user.id);
     const followers = await followersStmt.first();
-    const followingStmt = await env.DB.prepare(
-      'SELECT COUNT(*) as count FROM follows WHERE follower_id = ?'
-    ).bind(user.id);
+
+    const followingStmt = await env.DB.prepare('SELECT COUNT(*) as count FROM follows WHERE follower_id = ?').bind(user.id);
     const following = await followingStmt.first();
 
     return successResponse({
       ...user,
+      is_admin: user.is_admin === 1,
       followers_count: followers?.count || 0,
       following_count: following?.count || 0,
-      stats
+      stats: {
+        total_answers: statsResult?.total_answers || 0,
+        accuracy: Math.round(statsResult?.avg_accuracy || 0),
+        total_score: statsResult?.total_score || 0
+      }
     });
   } catch (e) {
     return errorResponse(e.message);
   }
 }
 
-// ===== 5. التحقق من التوكن =====
 async function handleVerifyToken(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -369,7 +357,55 @@ async function handleVerifyToken(request, env) {
   });
 }
 
-// ===== 6. تحديث صورة البروفايل (مع إعادة بيانات المستخدم) =====
+async function handleRefreshToken(request, env) {
+  let token = getAuthToken(request);
+
+  // دعم استخراج التوكن من الجسم إن وُجد
+  if (!token && request.method === 'POST') {
+    try {
+      const body = await request.clone().json();
+      token = body.refreshToken || body.token || null;
+    } catch (e) {}
+  }
+
+  if (!token) return errorResponse('غير مصرح', 401);
+
+  // السماح بالتجديد للمستخدم النشط
+  const stmt = await env.DB.prepare(
+    'SELECT * FROM users WHERE token = ? AND (deleted_at IS NULL OR deleted_at = "")'
+  ).bind(token);
+  const user = await stmt.first();
+
+  if (!user) return errorResponse('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً', 401);
+
+  try {
+    const newToken = generateToken();
+    await env.DB.prepare(
+      "UPDATE users SET token = ?, token_expires_at = datetime('now', '+30 days') WHERE id = ?"
+    ).bind(newToken, user.id).run();
+
+    return successResponse({
+      token: newToken,
+      refreshToken: newToken,
+      user: {
+        id: user.id,
+        username: user.username,
+        full_name: user.full_name,
+        email: user.email,
+        badge: user.badge || 'none',
+        governorate: user.governorate,
+        school: user.school,
+        age: user.age,
+        avatar: user.avatar || null,
+        is_admin: user.is_admin === 1,
+        created_at: user.created_at
+      }
+    });
+  } catch (e) {
+    return errorResponse(e.message);
+  }
+}
+
 async function handleAvatarUpload(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -381,11 +417,10 @@ async function handleAvatarUpload(request, env) {
     const formData = await request.formData();
     const file = formData.get('avatar');
     if (!file) return errorResponse('الملف مطلوب');
-
     if (file.size > 5 * 1024 * 1024) return errorResponse('حجم الصورة يجب أن يكون أقل من 5 ميجابايت');
 
     const buffer = await file.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+    const base64 = arrayBufferToBase64(buffer);
     const mimeType = file.type || 'image/jpeg';
     const dataUrl = `data:${mimeType};base64,${base64}`;
 
@@ -393,22 +428,17 @@ async function handleAvatarUpload(request, env) {
     const imageUrl = await storeImage(env, dataUrl, key);
     if (!imageUrl) return errorResponse('فشل رفع الصورة إلى التخزين');
 
-    await env.DB.prepare('UPDATE users SET avatar = ? WHERE id = ?')
-      .bind(imageUrl, user.id)
-      .run();
+    await env.DB.prepare('UPDATE users SET avatar = ? WHERE id = ?').bind(imageUrl, user.id).run();
 
-    // إعادة بيانات المستخدم المحدثة
     const updatedUser = await env.DB.prepare(
       'SELECT id, username, full_name, email, badge, governorate, school, age, avatar, is_admin, created_at FROM users WHERE id = ?'
     ).bind(user.id).first();
 
-    return successResponse({ user: updatedUser });
+    return successResponse({ user: { ...updatedUser, is_admin: updatedUser.is_admin === 1 } });
   } catch (e) {
     return errorResponse(e.message);
   }
-}
-
-// ===== 7. تحديث الملف الشخصي (مع إعادة بيانات المستخدم) =====
+  }
 async function handleUserProfileUpdate(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -437,13 +467,12 @@ async function handleUserProfileUpdate(request, env) {
       'SELECT id, username, full_name, email, badge, governorate, school, age, avatar, is_admin, created_at FROM users WHERE id = ?'
     ).bind(user.id).first();
 
-    return successResponse({ user: updatedUser });
+    return successResponse({ user: { ...updatedUser, is_admin: updatedUser.is_admin === 1 } });
   } catch (e) {
     return errorResponse(e.message);
   }
 }
 
-// ===== 8. حذف الحساب (Soft Delete) =====
 async function handleUserDelete(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -452,17 +481,13 @@ async function handleUserDelete(request, env) {
   if (!user) return errorResponse('توكن غير صالح', 401);
 
   try {
-    // ✅ إبطال التوكن ومسح تاريخ الانتهاء
     await env.DB.prepare(
       'UPDATE users SET deleted_at = datetime("now"), token = NULL, token_expires_at = NULL WHERE id = ?'
-    ).bind(user.id)
-      .run();
+    ).bind(user.id).run();
 
-    if (user.avatar) {
+    if (user.avatar && env.IMAGES) {
       const key = user.avatar.split('/').pop();
-      if (key && env.IMAGES) {
-        await env.IMAGES.delete(key).catch(() => {});
-      }
+      if (key) await env.IMAGES.delete(key).catch(() => {});
     }
 
     return successResponse({ message: 'تم حذف الحساب بنجاح' });
@@ -471,7 +496,17 @@ async function handleUserDelete(request, env) {
   }
 }
 
-// ===== 9. إحصائيات المستخدم (جلب حقيقي) =====
+async function handleUserLogout(request, env) {
+  const token = getAuthToken(request);
+  if (!token) return errorResponse('غير مصرح', 401);
+
+  await env.DB.prepare(
+    'UPDATE users SET token = NULL, token_expires_at = NULL WHERE token = ?'
+  ).bind(token).run();
+
+  return successResponse({ message: 'تم تسجيل الخروج بنجاح' });
+}
+
 async function handleUserStats(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -483,8 +518,8 @@ async function handleUserStats(request, env) {
     const statsStmt = await env.DB.prepare(`
       SELECT 
         COUNT(*) as total_answers,
-        AVG(percentage) as avg_accuracy,
-        SUM(score) as total_score
+        COALESCE(AVG(percentage), 0) as avg_accuracy,
+        COALESCE(SUM(score), 0) as total_score
       FROM results 
       WHERE user_id = ?
     `).bind(user.id);
@@ -504,7 +539,7 @@ async function handleUserStats(request, env) {
     const catResults = await catStmt.all();
 
     const categories = catResults.results.map(c => ({
-      id: c.quiz_id?.split('_')[0] || 'general',
+      id: c.quiz_id || 'general',
       name: c.quiz_id || 'عام',
       progress: Math.round(c.avg || 0),
       questions: c.count || 0
@@ -514,100 +549,33 @@ async function handleUserStats(request, env) {
       total_answers: stats?.total_answers || 0,
       accuracy: Math.round(stats?.avg_accuracy || 0),
       total_score: stats?.total_score || 0,
-      categories: categories.length > 0 ? categories : []
-    });
-  } catch (e) {
-    return errorResponse(e.message);
-  }
-}
-// ================================================================
-//  ✅ التعديل 7: تسجيل الخروج (إبطال التوكن ومسح token_expires_at)
-// ================================================================
-
-async function handleUserLogout(request, env) {
-  const token = getAuthToken(request);
-  if (!token) return errorResponse('غير مصرح', 401);
-  const user = await verifyToken(token, env);
-  if (!user) return errorResponse('توكن غير صالح', 401);
-  
-  await env.DB.prepare(
-    'UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = ?'
-  ).bind(user.id).run();
-  
-  return successResponse({ message: 'تم تسجيل الخروج بنجاح' });
-      }
-// ================================================================
-//  ✅ إصلاح: تجديد التوكن (Refresh) — لم يكن هذا المسار موجوداً إطلاقاً
-//  رغم أن الواجهة الأمامية كانت تعتمد عليه، مما كان يسبب تسجيل خروج
-//  فوري لأي مستخدم بمجرد فشل عابر في التحقق من التوكن.
-//  نجدد هنا نفس التوكن الحالي طالما أنه لا يزال صالحاً (لا نحتاج
-//  نظام refresh-token منفصل طالما التوكن الأساسي صالح لمدة 30 يوماً).
-// ================================================================
-async function handleRefreshToken(request, env) {
-  const token = getAuthToken(request);
-  if (!token) return errorResponse('غير مصرح', 401);
-
-  const user = await verifyToken(token, env);
-  if (!user) return errorResponse('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً', 401);
-
-  try {
-    const newToken = generateToken();
-    await env.DB.prepare(
-      "UPDATE users SET token = ?, token_expires_at = datetime('now', '+30 days') WHERE id = ?"
-    ).bind(newToken, user.id).run();
-
-    return successResponse({
-      token: newToken,
-      user: {
-        id: user.id,
-        username: user.username,
-        full_name: user.full_name,
-        email: user.email,
-        badge: user.badge || 'none',
-        governorate: user.governorate,
-        school: user.school,
-        age: user.age,
-        avatar: user.avatar || null,
-        is_admin: user.is_admin === 1,
-        created_at: user.created_at
-      }
+      categories
     });
   } catch (e) {
     return errorResponse(e.message);
   }
 }
 
-// ===== 10. نظام المتابعة =====
+// ===== نظام المتابعة =====
 async function handleFollow(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
-
   const user = await verifyToken(token, env);
   if (!user) return errorResponse('توكن غير صالح', 401);
 
   try {
     const body = await request.json();
-    const { targetId } = body;
-    if (!targetId) return errorResponse('معرف المستخدم المستهدف مطلوب');
+    const targetId = parseInt(body.targetId, 10);
+    if (isNaN(targetId)) return errorResponse('معرف المستخدم غير صحيح');
+    if (targetId === user.id) return errorResponse('لا يمكن متابعة النفس');
 
-    if (parseInt(targetId) === user.id) return errorResponse('لا يمكن متابعة النفس');
-
-    const check = await env.DB.prepare(
-      'SELECT id FROM users WHERE id = ? AND (deleted_at IS NULL OR deleted_at = "")'
-    ).bind(parseInt(targetId));
-    const target = await check.first();
+    const target = await env.DB.prepare('SELECT id FROM users WHERE id = ? AND (deleted_at IS NULL OR deleted_at = "")').bind(targetId).first();
     if (!target) return errorResponse('المستخدم غير موجود', 404);
 
-    const existing = await env.DB.prepare(
-      'SELECT id FROM follows WHERE follower_id = ? AND following_id = ?'
-    ).bind(user.id, parseInt(targetId));
-    const found = await existing.first();
-    if (found) return errorResponse('أنت تتابع هذا المستخدم بالفعل', 400);
+    const existing = await env.DB.prepare('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?').bind(user.id, targetId).first();
+    if (existing) return errorResponse('أنت تتابع هذا المستخدم بالفعل', 400);
 
-    await env.DB.prepare(
-      'INSERT INTO follows (follower_id, following_id, created_at) VALUES (?, ?, datetime("now"))'
-    ).bind(user.id, parseInt(targetId)).run();
-
+    await env.DB.prepare('INSERT INTO follows (follower_id, following_id, created_at) VALUES (?, ?, datetime("now"))').bind(user.id, targetId).run();
     return successResponse({ message: 'تمت المتابعة بنجاح' });
   } catch (e) {
     return errorResponse(e.message);
@@ -617,19 +585,15 @@ async function handleFollow(request, env) {
 async function handleUnfollow(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
-
   const user = await verifyToken(token, env);
   if (!user) return errorResponse('توكن غير صالح', 401);
 
   try {
     const body = await request.json();
-    const { targetId } = body;
-    if (!targetId) return errorResponse('معرف المستخدم المستهدف مطلوب');
+    const targetId = parseInt(body.targetId, 10);
+    if (isNaN(targetId)) return errorResponse('معرف المستخدم غير صحيح');
 
-    await env.DB.prepare(
-      'DELETE FROM follows WHERE follower_id = ? AND following_id = ?'
-    ).bind(user.id, parseInt(targetId)).run();
-
+    await env.DB.prepare('DELETE FROM follows WHERE follower_id = ? AND following_id = ?').bind(user.id, targetId).run();
     return successResponse({ message: 'تم إلغاء المتابعة' });
   } catch (e) {
     return errorResponse(e.message);
@@ -639,17 +603,13 @@ async function handleUnfollow(request, env) {
 async function handleUserFollowing(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
-
   const user = await verifyToken(token, env);
   if (!user) return errorResponse('توكن غير صالح', 401);
 
   try {
-    const stmt = await env.DB.prepare(
-      'SELECT following_id FROM follows WHERE follower_id = ?'
-    ).bind(user.id);
+    const stmt = await env.DB.prepare('SELECT following_id FROM follows WHERE follower_id = ?').bind(user.id);
     const result = await stmt.all();
-    const following = result.results.map(r => r.following_id);
-    return successResponse({ following });
+    return successResponse({ following: result.results.map(r => r.following_id) });
   } catch (e) {
     return errorResponse(e.message);
   }
@@ -662,9 +622,10 @@ async function handleFollowersList(request, env, userId) {
       FROM users u
       JOIN follows f ON u.id = f.follower_id
       WHERE f.following_id = ? AND (u.deleted_at IS NULL OR u.deleted_at = "")
-    `).bind(parseInt(userId));
+    `).bind(parseInt(userId, 10));
     const result = await stmt.all();
-    return successResponse(result.results);
+    const list = result.results.map(u => ({ ...u, is_admin: u.is_admin === 1 }));
+    return successResponse(list);
   } catch (e) {
     return errorResponse(e.message);
   }
@@ -677,21 +638,22 @@ async function handleFollowingList(request, env, userId) {
       FROM users u
       JOIN follows f ON u.id = f.following_id
       WHERE f.follower_id = ? AND (u.deleted_at IS NULL OR u.deleted_at = "")
-    `).bind(parseInt(userId));
+    `).bind(parseInt(userId, 10));
     const result = await stmt.all();
-    return successResponse(result.results);
+    const list = result.results.map(u => ({ ...u, is_admin: u.is_admin === 1 }));
+    return successResponse(list);
   } catch (e) {
     return errorResponse(e.message);
   }
 }
+
 // ================================================================
-//  PART 2: QUESTIONS HANDLERS (مع دعم Soft Delete)
+//  PART 3: الأسئلة (نظام مفرد ونظيف يعتمد على المعرف الرقمي)
 // ================================================================
 
-// ===== الأسئلة (رفع + جلب) =====
+// ===== جلب الأسئلة للاختبارات + إضافة سؤال جديد =====
 async function handleQuestions(request, env) {
   const url = new URL(request.url);
-  const quizId = url.searchParams.get('quizId');
 
   // POST: رفع سؤال جديد
   if (request.method === 'POST') {
@@ -714,10 +676,10 @@ async function handleQuestions(request, env) {
           category: formData.get('category'),
           subject: formData.get('subject'),
           model: formData.get('model'),
-          question_number: parseInt(formData.get('question_number')),
+          question_number: parseInt(formData.get('question_number') || 0, 10),
           text: formData.get('text'),
           options: JSON.parse(formData.get('options') || '[]'),
-          correct: parseInt(formData.get('correct')),
+          correct: parseInt(formData.get('correct'), 10),
           explanation: formData.get('explanation'),
           model_name: formData.get('model_name')
         };
@@ -727,8 +689,7 @@ async function handleQuestions(request, env) {
             return errorResponse('حجم الصورة يجب أن يكون أقل من 5 ميجابايت', 400);
           }
           const buffer = await imageFile.arrayBuffer();
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
-          imageData = `data:${imageFile.type};base64,${base64}`;
+          imageData = `data:${imageFile.type || 'image/jpeg'};base64,${arrayBufferToBase64(buffer)}`;
         }
       } else {
         body = await request.json();
@@ -747,145 +708,137 @@ async function handleQuestions(request, env) {
         imageUrl = await storeImage(env, imageData, key);
       }
 
-      // ✅ التعديل 3: إزالة حقل status من INSERT
+      // ✅ تم تضمين model_name في جملة الإضافة
       const stmt = await env.DB.prepare(`
-        INSERT INTO questions (category, subject, model, question_number, text, options, correct, explanation, image, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO questions (category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).bind(
         category, subject, model, question_number || 0,
         text, JSON.stringify(options), correct,
-        explanation || null, imageUrl || null,
+        explanation || null, imageUrl || null, model_name || null,
         user.id
       );
 
       await stmt.run();
-
       const result = await env.DB.prepare('SELECT last_insert_rowid() as id').first();
-      const newId = result.id;
-      const questionId = `${category}_${subject}_${model}_q${question_number}`;
 
-      // ✅ التعديل 4: تغيير رسالة النجاح
       return successResponse({
         message: 'تم رفع السؤال بنجاح',
-        id: newId,
-        questionId: questionId
+        id: result ? result.id : null
       });
     } catch (e) {
       return errorResponse(e.message);
     }
   }
 
-  // GET: جلب الأسئلة
+  // GET: جلب أسئلة الاختبار عبر المعايير الصريحة
   if (request.method === 'GET') {
-    // ❌ التعديل 2: حذف منطق ?pending=true بالكامل
+    let category = url.searchParams.get('category');
+    let subject = url.searchParams.get('subject');
+    let model = url.searchParams.get('model');
+    const quizId = url.searchParams.get('quizId');
 
-    // جلب الأسئلة حسب quizId (مع استبعاد المحذوفة)
-    if (quizId) {
-      try {
-        const parts = quizId.split('_');
-        let category = parts[0];
-        if (parts[1] && ['juniors', 'youth', 'grade10', 'grade9', 'grade7'].includes(parts[1])) {
-          category += '_' + parts[1];
-        }
-        const subject = parts[2] || '';
-        const model = parts[3] || '';
-
-        // ✅ التعديل 5: استبدال SELECT * بأعمدة محددة
-        let query = `
-          SELECT id, category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_at
-          FROM questions
-          WHERE (deleted_at IS NULL OR deleted_at = "")
-        `;
-        const params = [];
-
-        if (category) {
-          query += ' AND category = ?';
-          params.push(category);
-        }
-        if (subject) {
-          query += ' AND subject = ?';
-          params.push(subject);
-        }
-        if (model && model !== 'random') {
-          query += ' AND model = ?';
-          params.push(model);
-        }
-
-        if (model === 'random' || quizId.endsWith('_random')) {
-          query += ' ORDER BY RANDOM() LIMIT 30';
-        } else {
-          query += ' ORDER BY RANDOM() LIMIT 10';
-        }
-
-        const stmt = await env.DB.prepare(query).bind(...params);
-        const questions = await stmt.all();
-
-        const processed = questions.results.map(q => ({
-          ...q,
-          options: typeof q.options === 'string' ? JSON.parse(q.options) : q.options
-        }));
-
-        return successResponse({ questions: processed });
-      } catch (e) {
-        return errorResponse(e.message);
+    // دعم توافقي عند تمرير quizId
+    if (!category && quizId) {
+      const parts = quizId.split('_');
+      if (parts.length >= 3) {
+        category = parts[0];
+        subject = parts[1];
+        model = parts[2];
       }
     }
 
-    return errorResponse('معرف الاختبار مطلوب', 400);
+    if (!category || !subject) {
+      return errorResponse('الفئة والمادة مطلوبان', 400);
+    }
+
+    try {
+      let query = `
+        SELECT id, category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_at
+        FROM questions
+        WHERE (deleted_at IS NULL OR deleted_at = "")
+          AND category = ?
+          AND subject = ?
+      `;
+      const params = [category, subject];
+
+      if (model && model !== 'random') {
+        query += ' AND model = ? ORDER BY question_number ASC';
+        params.push(model);
+      } else {
+        query += ' ORDER BY RANDOM() LIMIT 30';
+      }
+
+      const stmt = await env.DB.prepare(query).bind(...params);
+      const questions = await stmt.all();
+
+      const processed = questions.results.map(q => {
+        let opts = q.options;
+        if (typeof opts === 'string') {
+          try { opts = JSON.parse(opts); } catch (e) { opts = []; }
+        }
+        return { ...q, options: opts };
+      });
+
+      return successResponse({ questions: processed });
+    } catch (e) {
+      return errorResponse(e.message);
+    }
   }
 
   return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// ❌ التعديل 1: حذف handleQuestionUpdate بالكامل
+// ===== جلب سؤال مفرد بالمعرف الرقمي الصريح =====
+async function handleGetSingleQuestion(request, env, id) {
+  const numericId = parseInt(id, 10);
+  if (isNaN(numericId)) return errorResponse('معرف السؤال يجب أن يكون رقماً صحيحاً', 400);
 
-// ===== حذف سؤال (Soft Delete) - يدعم المعرف الرقمي والنصي =====
+  try {
+    const stmt = await env.DB.prepare(`
+      SELECT id, category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_at
+      FROM questions 
+      WHERE id = ? AND (deleted_at IS NULL OR deleted_at = "")
+    `).bind(numericId);
+
+    const question = await stmt.first();
+    if (!question) return errorResponse('السؤال غير موجود', 404);
+
+    if (question.options && typeof question.options === 'string') {
+      try { question.options = JSON.parse(question.options); } catch (e) { question.options = []; }
+    }
+
+    return successResponse(question);
+  } catch (e) {
+    return errorResponse(e.message);
+  }
+}
+
+// ===== حذف سؤال بالمعرف الرقمي الصريح (Soft Delete) =====
 async function handleQuestionDelete(request, env, id) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
 
   const user = await verifyToken(token, env);
   if (!user || user.is_admin !== 1) {
-    return errorResponse('غير مصرح', 403);
+    return errorResponse('غير مصرح، تحتاج صلاحية مشرف', 403);
   }
 
+  const numericId = parseInt(id, 10);
+  if (isNaN(numericId)) return errorResponse('معرف السؤال يجب أن يكون رقماً صحيحاً', 400);
+
   try {
-    let query = 'UPDATE questions SET deleted_at = datetime("now") WHERE ';
-    const params = [];
+    await env.DB.prepare(
+      'UPDATE questions SET deleted_at = datetime("now") WHERE id = ? AND (deleted_at IS NULL OR deleted_at = "")'
+    ).bind(numericId).run();
 
-    // إذا كان المعرف رقمياً
-    if (/^\d+$/.test(id)) {
-      // ✅ التعديل 8: إضافة شرط deleted_at للاتساق
-      query += 'id = ? AND (deleted_at IS NULL OR deleted_at = "")';
-      params.push(parseInt(id));
-    } else {
-      // معرف نصي مركب: category_subject_model_qNum
-      const parts = id.split('_');
-      let category = parts[0];
-      if (parts[1] && ['juniors', 'youth', 'grade10', 'grade9', 'grade7'].includes(parts[1])) {
-        category += '_' + parts[1];
-        parts.splice(1, 1);
-      }
-      const subject = parts[1] || '';
-      const model = parts[2] || '';
-      const qNum = parseInt(parts[3]?.replace('q', '') || 0);
-
-      if (!category || !subject || !model || !qNum) {
-        return errorResponse('معرف غير صالح', 400);
-      }
-
-      query += 'category = ? AND subject = ? AND model = ? AND question_number = ? AND (deleted_at IS NULL OR deleted_at = "")';
-      params.push(category, subject, model, qNum);
-    }
-
-    await env.DB.prepare(query).bind(...params).run();
-    return successResponse({ message: 'تم حذف السؤال' });
+    return successResponse({ message: 'تم حذف السؤال بنجاح' });
   } catch (e) {
     return errorResponse(e.message);
   }
 }
 
-// ===== تحديث سؤال بالكامل (المحتوى) - يدعم المعرف الرقمي والنصي =====
+// ===== تحديث سؤال بالمعرف الرقمي الصريح =====
 async function handleQuestionFullUpdate(request, env, id) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -894,6 +847,9 @@ async function handleQuestionFullUpdate(request, env, id) {
   if (!user || user.is_admin !== 1) {
     return errorResponse('غير مصرح، تحتاج صلاحية مشرف', 403);
   }
+
+  const numericId = parseInt(id, 10);
+  if (isNaN(numericId)) return errorResponse('معرف السؤال يجب أن يكون رقماً صحيحاً', 400);
 
   try {
     let body;
@@ -906,10 +862,10 @@ async function handleQuestionFullUpdate(request, env, id) {
         category: formData.get('category'),
         subject: formData.get('subject'),
         model: formData.get('model'),
-        question_number: parseInt(formData.get('question_number')),
+        question_number: parseInt(formData.get('question_number') || 0, 10),
         text: formData.get('text'),
         options: JSON.parse(formData.get('options') || '[]'),
-        correct: parseInt(formData.get('correct')),
+        correct: parseInt(formData.get('correct'), 10),
         explanation: formData.get('explanation'),
         model_name: formData.get('model_name')
       };
@@ -919,15 +875,13 @@ async function handleQuestionFullUpdate(request, env, id) {
           return errorResponse('حجم الصورة يجب أن يكون أقل من 5 ميجابايت', 400);
         }
         const buffer = await imageFile.arrayBuffer();
-        const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
-        imageData = `data:${imageFile.type};base64,${base64}`;
+        imageData = `data:${imageFile.type || 'image/jpeg'};base64,${arrayBufferToBase64(buffer)}`;
       }
     } else {
       body = await request.json();
       imageData = body.image || null;
-    }
-
-    const { category, subject, model, question_number, text, options, correct, explanation, model_name } = body;
+          }
+        const { category, subject, model, question_number, text, options, correct, explanation, model_name } = body;
 
     if (!category || !subject || !model || !text || !options || correct === undefined) {
       return errorResponse('جميع الحقول المطلوبة يجب تعبئتها');
@@ -951,103 +905,28 @@ async function handleQuestionFullUpdate(request, env, id) {
       params.push(imageUrl);
     }
 
-    // دعم المعرف النصي والرقمي
-    updateQuery += ' WHERE ';
-    if (/^\d+$/.test(id)) {
-      updateQuery += 'id = ? AND (deleted_at IS NULL OR deleted_at = "")';
-      params.push(parseInt(id));
-    } else {
-      const parts = id.split('_');
-      let cat = parts[0];
-      if (parts[1] && ['juniors', 'youth', 'grade10', 'grade9', 'grade7'].includes(parts[1])) {
-        cat += '_' + parts[1];
-        parts.splice(1, 1);
-      }
-      const subj = parts[1] || '';
-      const mdl = parts[2] || '';
-      const qNum = parseInt(parts[3]?.replace('q', '') || 0);
-
-      if (!cat || !subj || !mdl || !qNum) {
-        return errorResponse('معرف غير صالح', 400);
-      }
-
-      updateQuery += 'category = ? AND subject = ? AND model = ? AND question_number = ? AND (deleted_at IS NULL OR deleted_at = "")';
-      params.push(cat, subj, mdl, qNum);
-    }
+    updateQuery += ' WHERE id = ? AND (deleted_at IS NULL OR deleted_at = "")';
+    params.push(numericId);
 
     await env.DB.prepare(updateQuery).bind(...params).run();
 
-    // ✅ التعديل 6: جلب السؤال المحدث بأعمدة محددة
-    let fetchQuery = `
+    const updated = await env.DB.prepare(`
       SELECT id, category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_at
-      FROM questions WHERE
-    `;
-    const fetchParams = [];
-    if (/^\d+$/.test(id)) {
-      fetchQuery += 'id = ?';
-      fetchParams.push(parseInt(id));
-    } else {
-      const parts = id.split('_');
-      let cat = parts[0];
-      if (parts[1] && ['juniors', 'youth', 'grade10', 'grade9', 'grade7'].includes(parts[1])) {
-        cat += '_' + parts[1];
-        parts.splice(1, 1);
-      }
-      const subj = parts[1] || '';
-      const mdl = parts[2] || '';
-      const qNum = parseInt(parts[3]?.replace('q', '') || 0);
-      fetchQuery += 'category = ? AND subject = ? AND model = ? AND question_number = ?';
-      fetchParams.push(cat, subj, mdl, qNum);
+      FROM questions WHERE id = ?
+    `).bind(numericId).first();
+
+    if (updated && updated.options && typeof updated.options === 'string') {
+      try { updated.options = JSON.parse(updated.options); } catch (e) { updated.options = []; }
     }
 
-    const updated = await env.DB.prepare(fetchQuery).bind(...fetchParams).first();
-    if (updated && updated.options) {
-      updated.options = typeof updated.options === 'string' ? JSON.parse(updated.options) : updated.options;
-    }
-
-    return successResponse({ message: 'تم تحديث السؤال', question: updated });
+    return successResponse({ message: 'تم تحديث السؤال بنجاح', question: updated });
   } catch (e) {
     return errorResponse(e.message);
   }
 }
 
-// ===== جلب سؤال مفرد بواسطة المعرف النصي – نقطة نهاية جديدة =====
-async function handleGetSingleQuestion(request, env, fullId) {
-  try {
-    const parts = fullId.split('_');
-    let category = parts[0];
-    if (parts[1] && ['juniors', 'youth', 'grade10', 'grade9', 'grade7'].includes(parts[1])) {
-      category += '_' + parts[1];
-      parts.splice(1, 1);
-    }
-    const subject = parts[1] || '';
-    const model = parts[2] || '';
-    const qNum = parseInt(parts[3]?.replace('q', '') || 0);
-
-    if (!category || !subject || !model || !qNum) {
-      return errorResponse('معرف غير صالح', 400);
-    }
-
-    // ✅ التعديل 7: استبدال SELECT * بأعمدة محددة
-    const stmt = await env.DB.prepare(`
-      SELECT id, category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_at
-      FROM questions 
-      WHERE category = ? AND subject = ? AND model = ? AND question_number = ?
-      AND (deleted_at IS NULL OR deleted_at = "")
-    `).bind(category, subject, model, qNum);
-    const question = await stmt.first();
-    if (!question) return errorResponse('السؤال غير موجود', 404);
-
-    if (question.options) {
-      question.options = typeof question.options === 'string' ? JSON.parse(question.options) : question.options;
-    }
-    return successResponse(question);
-  } catch (e) {
-    return errorResponse(e.message);
-  }
-          }
 // ================================================================
-//  PART 3: POSTS, RESULTS, LEADERBOARD, SEARCH (مع Soft Delete)
+//  PART 4: المنشورات والنتائج والمتصدرين والبحث
 // ================================================================
 
 // ===== المنشورات =====
@@ -1055,7 +934,6 @@ async function handlePosts(request, env) {
   if (request.method === 'POST') {
     const token = getAuthToken(request);
     if (!token) return errorResponse('غير مصرح', 401);
-
     const user = await verifyToken(token, env);
     if (!user) return errorResponse('توكن غير صالح', 401);
 
@@ -1070,12 +948,9 @@ async function handlePosts(request, env) {
         category = formData.get('category') || 'general';
         const imageFile = formData.get('image');
         if (imageFile && imageFile.size > 0) {
-          if (imageFile.size > 5 * 1024 * 1024) {
-            return errorResponse('حجم الصورة يجب أن يكون أقل من 5 ميجابايت', 400);
-          }
+          if (imageFile.size > 5 * 1024 * 1024) return errorResponse('حجم الصورة يجب أن يكون أقل من 5 ميجابايت', 400);
           const buffer = await imageFile.arrayBuffer();
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
-          imageData = `data:${imageFile.type};base64,${base64}`;
+          imageData = `data:${imageFile.type || 'image/jpeg'};base64,${arrayBufferToBase64(buffer)}`;
         }
       } else {
         const body = await request.json();
@@ -1085,9 +960,7 @@ async function handlePosts(request, env) {
         imageData = body.image || null;
       }
 
-      if (!title || !content) {
-        return errorResponse('العنوان والمحتوى مطلوبان');
-      }
+      if (!title || !content) return errorResponse('العنوان والمحتوى مطلوبان');
 
       let imageUrl = null;
       if (imageData) {
@@ -1095,22 +968,19 @@ async function handlePosts(request, env) {
         imageUrl = await storeImage(env, imageData, key);
       }
 
-      const stmt = await env.DB.prepare(`
+      await env.DB.prepare(`
         INSERT INTO posts (user_id, title, content, category, image, created_at)
         VALUES (?, ?, ?, ?, ?, datetime('now'))
-      `).bind(user.id, title, content, category, imageUrl);
+      `).bind(user.id, title, content, category, imageUrl).run();
 
-      await stmt.run();
       return successResponse({ message: 'تم نشر المنشور بنجاح' });
     } catch (e) {
       return errorResponse(e.message);
     }
   }
 
-  // GET: جلب المنشورات مع بيانات المستخدم (استبعاد المحذوفين)
   if (request.method === 'GET') {
     try {
-      // ✅ التعديل 3: تحديد أعمدة posts بدلاً من SELECT p.*
       const stmt = await env.DB.prepare(`
         SELECT 
           p.id, p.title, p.content, p.category, p.image, p.created_at,
@@ -1121,7 +991,8 @@ async function handlePosts(request, env) {
         ORDER BY p.created_at DESC
       `);
       const posts = await stmt.all();
-      return successResponse({ posts: posts.results });
+      const list = posts.results.map(p => ({ ...p, is_admin: p.is_admin === 1 }));
+      return successResponse({ posts: list });
     } catch (e) {
       return errorResponse(e.message);
     }
@@ -1134,7 +1005,6 @@ async function handlePosts(request, env) {
 async function handleResults(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
-
   const user = await verifyToken(token, env);
   if (!user) return errorResponse('توكن غير صالح', 401);
 
@@ -1143,35 +1013,36 @@ async function handleResults(request, env) {
       const body = await request.json();
       const { quiz_id, score, total, percentage, answers, time_spent } = body;
 
-      const stmt = await env.DB.prepare(`
+      await env.DB.prepare(`
         INSERT INTO results (user_id, quiz_id, score, total, percentage, answers, time_spent, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(user.id, quiz_id, score, total, percentage, JSON.stringify(answers), time_spent || null);
+      `).bind(user.id, quiz_id, score, total, percentage, JSON.stringify(answers), time_spent || null).run();
 
-      await stmt.run();
       return successResponse({ message: 'تم حفظ النتيجة' });
     } catch (e) {
       return errorResponse(e.message);
     }
   }
 
-  // GET: جلب نتائج المستخدم
-  try {
-    // ✅ التعديل 2: تحديد الأعمدة المطلوبة بدلاً من SELECT *
-    const stmt = await env.DB.prepare(`
-      SELECT id, quiz_id, score, total, percentage, answers, time_spent, created_at
-      FROM results 
-      WHERE user_id = ? 
-      ORDER BY created_at DESC
-    `).bind(user.id);
-    const results = await stmt.all();
-    return successResponse({ results: results.results });
-  } catch (e) {
-    return errorResponse(e.message);
+  if (request.method === 'GET') {
+    try {
+      const stmt = await env.DB.prepare(`
+        SELECT id, quiz_id, score, total, percentage, answers, time_spent, created_at
+        FROM results 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC
+      `).bind(user.id);
+      const results = await stmt.all();
+      return successResponse({ results: results.results });
+    } catch (e) {
+      return errorResponse(e.message);
+    }
   }
+
+  return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// ===== لوحة المتصدرين (مع is_admin الموحد) =====
+// ===== لوحة المتصدرين =====
 async function handleLeaderboard(request, env) {
   const url = new URL(request.url);
   const category = url.searchParams.get('category');
@@ -1180,8 +1051,8 @@ async function handleLeaderboard(request, env) {
     let query = `
       SELECT u.id, u.username, u.full_name, u.badge, u.avatar,
              COUNT(r.id) as total_quizzes,
-             AVG(r.percentage) as avg_score,
-             SUM(r.score) as total_points,
+             COALESCE(AVG(r.percentage), 0) as avg_score,
+             COALESCE(SUM(r.score), 0) as total_points,
              u.is_admin
       FROM users u
       LEFT JOIN results r ON u.id = r.user_id
@@ -1194,7 +1065,7 @@ async function handleLeaderboard(request, env) {
       params.push(`${category}%`);
     }
 
-    query += ` GROUP BY u.id ORDER BY avg_score DESC LIMIT 100`;
+    query += ` GROUP BY u.id HAVING total_quizzes > 0 ORDER BY avg_score DESC, total_points DESC LIMIT 100`;
 
     const stmt = await env.DB.prepare(query).bind(...params);
     const data = await stmt.all();
@@ -1216,7 +1087,7 @@ async function handleLeaderboard(request, env) {
   }
 }
 
-// ===== البحث (مع استبعاد المحذوفين) =====
+// ===== البحث =====
 async function handleSearch(request, env) {
   const url = new URL(request.url);
   const query = url.searchParams.get('q');
@@ -1228,8 +1099,6 @@ async function handleSearch(request, env) {
   const searchTerm = `%${query.trim()}%`;
 
   try {
-    // ✅ التعديل 1: إزالة شرط status = 'approved'
-    // أسئلة
     const qStmt = await env.DB.prepare(`
       SELECT id, text as question_text, category, subject, model, options
       FROM questions
@@ -1238,7 +1107,6 @@ async function handleSearch(request, env) {
     `).bind(searchTerm);
     const questions = await qStmt.all();
 
-    // منشورات
     const pStmt = await env.DB.prepare(`
       SELECT p.id, p.title, p.content, p.category, u.full_name, u.username, u.avatar
       FROM posts p
@@ -1248,7 +1116,6 @@ async function handleSearch(request, env) {
     `).bind(searchTerm, searchTerm);
     const posts = await pStmt.all();
 
-    // مستخدمون (مع is_admin)
     const uStmt = await env.DB.prepare(`
       SELECT id, username, full_name, badge, avatar, is_admin
       FROM users
@@ -1258,26 +1125,30 @@ async function handleSearch(request, env) {
     const users = await uStmt.all();
 
     return successResponse({
-      questions: questions.results,
+      questions: questions.results.map(q => {
+        let opts = q.options;
+        if (typeof opts === 'string') {
+          try { opts = JSON.parse(opts); } catch (e) { opts = []; }
+        }
+        return { ...q, options: opts };
+      }),
       posts: posts.results,
-      users: users.results
+      users: users.results.map(u => ({ ...u, is_admin: u.is_admin === 1 }))
     });
   } catch (e) {
     return errorResponse(e.message);
   }
 }
+
 // ================================================================
-//  PART 4: METADATA & MAIN ROUTER (مع نقاط النهاية الجديدة)
+//  PART 5: البيانات الوصفية (Metadata)
 // ================================================================
 
-// ===== البيانات الوصفية (Metadata) – مع التخزين المؤقت =====
-// ✅ التعديل 1 + 2: تحديد الأعمدة وإضافة Cache
 async function handleMetadata(request, env) {
   const url = new URL(request.url);
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), request);
 
-  // محاولة جلب الاستجابة من الكاش
   let response = await cache.match(cacheKey);
   if (response) {
     const headers = new Headers(response.headers);
@@ -1290,11 +1161,7 @@ async function handleMetadata(request, env) {
     const category = url.searchParams.get('category');
     const subject = url.searchParams.get('subject');
 
-    // ✅ التعديل 1: تحديد الأعمدة المطلوبة بدلاً من SELECT *
-    let query = `
-      SELECT id, category, subject, model, display_name, icon_class, sort_order
-      FROM metadata
-    `;
+    let query = `SELECT id, category, subject, model, display_name, icon_class, sort_order FROM metadata`;
     const params = [];
     const conditions = [];
 
@@ -1307,10 +1174,7 @@ async function handleMetadata(request, env) {
       params.push(subject);
     }
 
-    if (conditions.length > 0) {
-      query += ' WHERE ' + conditions.join(' AND ');
-    }
-
+    if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
     query += ' ORDER BY sort_order ASC, model ASC';
 
     const stmt = await env.DB.prepare(query).bind(...params);
@@ -1318,9 +1182,7 @@ async function handleMetadata(request, env) {
 
     const data = {};
     result.results.forEach(row => {
-      if (!data[row.subject]) {
-        data[row.subject] = [];
-      }
+      if (!data[row.subject]) data[row.subject] = [];
       data[row.subject].push({
         model: row.model,
         display_name: row.display_name,
@@ -1334,31 +1196,28 @@ async function handleMetadata(request, env) {
     }));
 
     response = successResponse({ subjects, metadata: result.results });
-    
-    // ✅ التعديل 2: تخزين في الكاش لمدة ساعة
     response.headers.append('Cache-Control', 'public, max-age=3600');
     await cache.put(cacheKey, response.clone());
-    
+
     return response;
   } catch (e) {
     return errorResponse(e.message);
   }
 }
 
-// ===== إدارة النماذج (Metadata) مع is_admin =====
 async function handleMetadataManagement(request, env) {
   const url = new URL(request.url);
   const method = request.method;
 
+  const token = getAuthToken(request);
+  if (!token) return errorResponse('غير مصرح', 401);
+
+  const user = await verifyToken(token, env);
+  if (!user || user.is_admin !== 1) {
+    return errorResponse('غير مصرح، تحتاج صلاحية مشرف', 403);
+  }
+
   if (method === 'POST') {
-    const token = getAuthToken(request);
-    if (!token) return errorResponse('غير مصرح', 401);
-
-    const user = await verifyToken(token, env);
-    if (!user || user.is_admin !== 1) {
-      return errorResponse('غير مصرح، تحتاج صلاحية مشرف', 403);
-    }
-
     try {
       const body = await request.json();
       const { category, subject, model, display_name, icon_class } = body;
@@ -1369,19 +1228,14 @@ async function handleMetadataManagement(request, env) {
 
       const check = await env.DB.prepare(
         'SELECT id FROM metadata WHERE category = ? AND subject = ? AND model = ?'
-      ).bind(category, subject, model);
-      const existing = await check.first();
+      ).bind(category, subject, model).first();
 
-      if (existing) {
-        return errorResponse('هذا النموذج موجود بالفعل لهذا القسم والمادة');
-      }
+      if (check) return errorResponse('هذا النموذج موجود بالفعل لهذا القسم والمادة');
 
-      const stmt = await env.DB.prepare(`
+      await env.DB.prepare(`
         INSERT INTO metadata (category, subject, model, display_name, icon_class, sort_order)
         VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM metadata WHERE category = ? AND subject = ?))
-      `).bind(category, subject, model, display_name, icon_class || null, category, subject);
-
-      await stmt.run();
+      `).bind(category, subject, model, display_name, icon_class || null, category, subject).run();
 
       return successResponse({
         message: 'تم إضافة النموذج بنجاح',
@@ -1393,19 +1247,11 @@ async function handleMetadataManagement(request, env) {
   }
 
   if (method === 'DELETE') {
-    const token = getAuthToken(request);
-    if (!token) return errorResponse('غير مصرح', 401);
-
-    const user = await verifyToken(token, env);
-    if (!user || user.is_admin !== 1) {
-      return errorResponse('غير مصرح، تحتاج صلاحية مشرف', 403);
-    }
-
     try {
       const id = url.searchParams.get('id');
       if (!id) return errorResponse('معرف النموذج مطلوب');
 
-      await env.DB.prepare('DELETE FROM metadata WHERE id = ?').bind(parseInt(id)).run();
+      await env.DB.prepare('DELETE FROM metadata WHERE id = ?').bind(parseInt(id, 10)).run();
       return successResponse({ message: 'تم حذف النموذج بنجاح' });
     } catch (e) {
       return errorResponse(e.message);
@@ -1416,7 +1262,7 @@ async function handleMetadataManagement(request, env) {
 }
 
 // ================================================================
-//  MAIN ROUTER & EXPORT (مع جميع المسارات المعدلة والجديدة)
+//  PART 6: الموجه الرئيسي (Main Router)
 // ================================================================
 
 export default {
@@ -1426,143 +1272,76 @@ export default {
     const method = request.method;
 
     if (method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders()
-      });
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
     try {
-      // ===== المستخدمون =====
-      if (path === '/api/users/login' && method === 'POST') {
-        return await handleUserLogin(request, env);
-      }
-      if (path === '/api/users/signup' && method === 'POST') {
-        return await handleUserSignup(request, env);
-      }
-      if (path === '/api/users/me' && method === 'GET') {
-        return await handleUserMe(request, env);
-      }
-      if (path === '/api/users/profile' && method === 'GET') {
-        return await handleUserProfileById(request, env);
-      }
-      if (path === '/api/users/profile' && method === 'PUT') {
-        return await handleUserProfileUpdate(request, env);
-      }
-      if (path === '/api/users/avatar' && method === 'POST') {
-        return await handleAvatarUpload(request, env);
-      }
-      if (path === '/api/users/verify' && method === 'GET') {
-        return await handleVerifyToken(request, env);
-      }
-      if (path === '/api/users/delete' && method === 'DELETE') {
-        return await handleUserDelete(request, env);
-      }
-      if (path === '/api/users/stats' && method === 'GET') {
-        return await handleUserStats(request, env);
-      }
-      
-      // ✅ التعديل 5: استخدام handleUserLogout
-      if (path === '/api/users/logout' && method === 'POST') {
-        return await handleUserLogout(request, env);
-      }
+      // ===== 1. مسارات المستخدمين =====
+      if (path === '/api/users/login' && method === 'POST') return await handleUserLogin(request, env);
+      if (path === '/api/users/signup' && method === 'POST') return await handleUserSignup(request, env);
+      if (path === '/api/users/me' && method === 'GET') return await handleUserMe(request, env);
+      if (path === '/api/users/profile' && method === 'GET') return await handleUserProfileById(request, env);
+      if (path === '/api/users/profile' && method === 'PUT') return await handleUserProfileUpdate(request, env);
+      if (path === '/api/users/avatar' && method === 'POST') return await handleAvatarUpload(request, env);
+      if (path === '/api/users/verify' && method === 'GET') return await handleVerifyToken(request, env);
+      if (path === '/api/users/refresh' && method === 'POST') return await handleRefreshToken(request, env);
+      if (path === '/api/users/logout' && method === 'POST') return await handleUserLogout(request, env);
+      if (path === '/api/users/delete' && method === 'DELETE') return await handleUserDelete(request, env);
+      if (path === '/api/users/stats' && method === 'GET') return await handleUserStats(request, env);
 
-      // ✅ إصلاح: مسار تجديد التوكن (لم يكن موجوداً سابقاً)
-      if (path === '/api/users/refresh' && method === 'POST') {
-        return await handleRefreshToken(request, env);
-      }
-      
-      // المتابعة
-      if (path === '/api/users/follow' && method === 'POST') {
-        return await handleFollow(request, env);
-      }
-      if (path === '/api/users/unfollow' && method === 'DELETE') {
-        return await handleUnfollow(request, env);
-      }
-      if (path === '/api/users/me/following' && method === 'GET') {
-        return await handleUserFollowing(request, env);
-      }
+      // نظام المتابعة
+      if (path === '/api/users/follow' && method === 'POST') return await handleFollow(request, env);
+      if (path === '/api/users/unfollow' && method === 'DELETE') return await handleUnfollow(request, env);
+      if (path === '/api/users/me/following' && method === 'GET') return await handleUserFollowing(request, env);
       if (path.match(/^\/api\/users\/(\d+)\/followers$/) && method === 'GET') {
-        const match = path.match(/^\/api\/users\/(\d+)\/followers$/);
-        return await handleFollowersList(request, env, match[1]);
+        const id = path.split('/')[3];
+        return await handleFollowersList(request, env, id);
       }
       if (path.match(/^\/api\/users\/(\d+)\/following$/) && method === 'GET') {
-        const match = path.match(/^\/api\/users\/(\d+)\/following$/);
-        return await handleFollowingList(request, env, match[1]);
+        const id = path.split('/')[3];
+        return await handleFollowingList(request, env, id);
       }
 
-      // ===== الأسئلة =====
-      // ✅ التعديل 4: تبسيط مسار GET /api/questions
-      if (path === '/api/questions' && method === 'GET') {
-        return await handleQuestions(request, env);
-      }
-      if (path === '/api/questions' && method === 'POST') {
-        return await handleQuestions(request, env);
-      }
-      if (path === '/api/questions/upload' && method === 'POST') {
+      // ===== 2. مسارات الأسئلة (اعتماد المعرف الرقمي الصريح) =====
+      if ((path === '/api/questions' || path === '/api/questions/upload') && (method === 'GET' || method === 'POST')) {
         return await handleQuestions(request, env);
       }
 
-      // جلب سؤال مفرد بواسطة المعرف النصي
-      if (path.startsWith('/api/questions/') && method === 'GET') {
-        const id = path.replace('/api/questions/', '');
-        if (id && !/^\d+$/.test(id)) {
-          return await handleGetSingleQuestion(request, env, id);
-        }
+      // جلب سؤال مفرد بالرقم
+      if (path.match(/^\/api\/questions\/(\d+)$/) && method === 'GET') {
+        const id = path.split('/').pop();
+        return await handleGetSingleQuestion(request, env, id);
       }
 
-      // ❌ التعديل 3: حذف مسار PUT /api/questions/:id (تحديث الحالة) بالكامل
-
-      // تحديث السؤال بالكامل – يدعم المعرف النصي والرقمي
-      if (path.match(/^\/api\/questions\/(.+)$/) && method === 'PUT') {
+      // تحديث سؤال بالرقم
+      if (path.match(/^\/api\/questions\/(\d+)$/) && method === 'PUT') {
         const id = path.split('/').pop();
         return await handleQuestionFullUpdate(request, env, id);
       }
 
-      // حذف سؤال (يدعم المعرف النصي والرقمي مع Soft Delete)
-      if (path.match(/^\/api\/questions\/(.+)$/) && method === 'DELETE') {
+      // حذف سؤال بالرقم
+      if (path.match(/^\/api\/questions\/(\d+)$/) && method === 'DELETE') {
         const id = path.split('/').pop();
         return await handleQuestionDelete(request, env, id);
       }
 
-      // ===== المنشورات =====
-      if (path === '/api/posts') {
-        return await handlePosts(request, env);
-      }
+      // ===== 3. باقي الميزات =====
+      if (path === '/api/posts') return await handlePosts(request, env);
+      if (path === '/api/results') return await handleResults(request, env);
+      if (path === '/api/leaderboard' && method === 'GET') return await handleLeaderboard(request, env);
+      if (path === '/api/search' && method === 'GET') return await handleSearch(request, env);
 
-      // ===== النتائج =====
-      if (path === '/api/results') {
-        return await handleResults(request, env);
-      }
+      // البيانات الوصفية
+      if (path === '/api/metadata' && method === 'GET') return await handleMetadata(request, env);
+      if (path === '/api/metadata/manage') return await handleMetadataManagement(request, env);
 
-      // ===== لوحة المتصدرين =====
-      if (path === '/api/leaderboard') {
-        return await handleLeaderboard(request, env);
-      }
-
-      // ===== البحث =====
-      if (path === '/api/search') {
-        return await handleSearch(request, env);
-      }
-
-      // ===== البيانات الوصفية =====
-      if (path === '/api/metadata' && method === 'GET') {
-        return await handleMetadata(request, env);
-      }
-      if (path === '/api/metadata/manage') {
-        return await handleMetadataManagement(request, env);
-      }
-
-      // ===== جلب الصور من KV =====
+      // جلب الصور
       if (path.startsWith('/api/images/')) {
         const key = path.replace('/api/images/', '');
-        if (!env.IMAGES) {
-          return errorResponse('تخزين الصور غير متوفر', 503);
-        }
+        if (!env.IMAGES) return errorResponse('تخزين الصور غير متوفر', 503);
         const imageData = await getImage(env, key);
-        if (!imageData) {
-          return errorResponse('الصورة غير موجودة', 404);
-        }
+        if (!imageData) return errorResponse('الصورة غير موجودة', 404);
+
         let contentType = 'image/jpeg';
         if (imageData.startsWith('data:')) {
           const match = imageData.match(/^data:([^;]+);base64,/);
@@ -1580,11 +1359,9 @@ export default {
         });
       }
 
-      // ===== الصفحة الرئيسية =====
+      // المسار الافتراضي
       if (path === '/' || path === '') {
-        return new Response('Bright Quizzes API is running!', {
-          headers: corsHeaders()
-        });
+        return new Response('Bright Quizzes API is running cleanly!', { headers: corsHeaders() });
       }
 
       return errorResponse('المسار غير موجود', 404);
