@@ -156,9 +156,10 @@ async function handleUserLogin(request, env) {
     const allowed = await checkRateLimit(env, rlKey, 5, 300);
     if (!allowed) return errorResponse('محاولات كثيرة جداً، حاول مرة أخرى بعد قليل', 429);
 
+    // 🔥 دعم تسجيل الدخول باسم المستخدم أو البريد الإلكتروني في نفس الحقل
     const stmt = await env.DB.prepare(
-      'SELECT * FROM users WHERE username = ? AND (deleted_at IS NULL OR deleted_at = "")'
-    ).bind(username);
+      'SELECT * FROM users WHERE (username = ? OR email = ?) AND (deleted_at IS NULL OR deleted_at = "")'
+    ).bind(username, username);
     const user = await stmt.first();
 
     if (!user) return errorResponse('اسم المستخدم أو كلمة المرور غير صحيحة', 401);
@@ -202,7 +203,8 @@ async function handleUserLogin(request, env) {
         school: user.school,
         age: user.age,
         avatar: user.avatar || null,
-        is_admin: user.is_admin === 1,
+        // 🔥 توحيد شرط الأدمن كقيمة منطقية Boolean صريحة دائماً
+        is_admin: user.is_admin === 1 || user.is_admin === true || user.is_admin === '1',
         created_at: user.created_at
       }
     });
@@ -210,7 +212,6 @@ async function handleUserLogin(request, env) {
     return errorResponse(e.message);
   }
 }
-
 async function handleUserSignup(request, env) {
   try {
     const body = await request.json();
