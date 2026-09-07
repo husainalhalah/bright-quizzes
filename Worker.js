@@ -1323,7 +1323,7 @@ async function handleResults(request, env) {
 
   return errorResponse('طريقة غير مدعومة', 405);
 }
-لوحة المتصدرين
+//لوحة المتصدرين
 async function handleLeaderboard(request, env) {
   const url = new URL(request.url);
   const category = url.searchParams.get('category');
