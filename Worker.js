@@ -2,6 +2,7 @@
  * ================================================================
  *  Bright Quizzes API - Cloudflare Worker
  *  النسخة المحدثة: معمارية نقية ومعرفات مقسمة كلمة كلمة (Single-Word IDs)
+ *  (تمت إزالة استعلامات التهيئة التلقائية DDL بناءً على طلبك)
  * ================================================================
  */
 
@@ -124,32 +125,7 @@ async function getImage(env, key) {
   return await env.IMAGES.get(key);
 }
 
-// تهيئة الجداول وحقل bio في قاعدة بيانات D1 تلقائياً
-async function autoHealSchema(env) {
-  try {
-    await env.DB.prepare('ALTER TABLE users ADD COLUMN bio TEXT').run().catch(() => {});
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS post_likes (
-        post_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (post_id, user_id)
-      )
-    `).run().catch(() => {});
-
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS post_comments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        post_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        content TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run().catch(() => {});
-  } catch (e) {}
-}
-
-// التحقق من التوكن مع جلب النبذة (bio)
+// التحقق من التوكن مع جلب الحساب
 async function verifyToken(token, env) {
   if (!token) return null;
   try {
@@ -467,6 +443,7 @@ async function handleAvatarUpload(request, env) {
     return errorResponse(e.message);
   }
 }
+
 async function handleUserProfileUpdate(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -477,6 +454,14 @@ async function handleUserProfileUpdate(request, env) {
   try {
     const body = await request.json();
     const { full_name, email, age, governorate, school, bio } = body;
+
+    if (email && email !== user.email) {
+      if (!isValidEmail(email)) return errorResponse('البريد الإلكتروني غير صحيح');
+      const emailCheck = await env.DB.prepare(
+        'SELECT id FROM users WHERE email = ? AND id != ? AND (deleted_at IS NULL OR deleted_at = "")'
+      ).bind(email, user.id).first();
+      if (emailCheck) return errorResponse('البريد الإلكتروني مستخدم بالفعل');
+    }
 
     await env.DB.prepare(`
       UPDATE users
@@ -518,13 +503,6 @@ async function handleUserDelete(request, env) {
       const key = user.avatar.split('/').pop();
       if (key) await env.IMAGES.delete(key).catch(() => {});
     }
-
-    return successResponse({ message: 'تم حذف الحساب بنجاح' });
-  } catch (e) {
-    return errorResponse(e.message);
-  }
-}
-
 async function handleUserLogout(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -563,7 +541,6 @@ async function handleUserStats(request, env) {
     `).bind(user.id);
     const catResults = await catStmt.all();
 
-    // قائمة الأسماء المعروضة للمعرفات المفردة
     const labelMap = {
       juniors: 'أولمبياد الصغار',
       youth: 'أولمبياد اليافعين',
@@ -578,7 +555,6 @@ async function handleUserStats(request, env) {
 
     const grouped = {};
     catResults.results.forEach(c => {
-      // استخراج الكلمة المفردة الأولى من quizId
       const singleWordKey = (c.quiz_id || '').split('_')[0] || 'general';
       const rootName = labelMap[singleWordKey] || singleWordKey;
 
@@ -633,6 +609,7 @@ async function handleFollow(request, env) {
   }
 }
 
+// إلغاء المتابعة مع دعم الاستلام من الـ Query Params أو الـ Body لتجنب أخطاء المتصفحات
 async function handleUnfollow(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -640,8 +617,16 @@ async function handleUnfollow(request, env) {
   if (!user) return errorResponse('توكن غير صالح', 401);
 
   try {
-    const body = await request.json();
-    const targetId = parseInt(body.targetId, 10);
+    const url = new URL(request.url);
+    let targetId = parseInt(url.searchParams.get('targetId') || '', 10);
+
+    if (isNaN(targetId)) {
+      try {
+        const body = await request.json();
+        targetId = parseInt(body?.targetId, 10);
+      } catch (e) {}
+    }
+
     if (isNaN(targetId)) return errorResponse('معرف المستخدم غير صحيح');
 
     await env.DB.prepare('DELETE FROM follows WHERE follower_id = ? AND following_id = ?').bind(user.id, targetId).run();
@@ -788,7 +773,7 @@ async function handleQuestions(request, env) {
     const quizId = url.searchParams.get('quizId');
     const mixed = url.searchParams.get('mixed');
 
-    // 🔥 1. دعم الاختبارات المختلطة
+    // دعم الاختبارات المختلطة
     if (mixed) {
       try {
         let mixedQuery = `
@@ -820,19 +805,17 @@ async function handleQuestions(request, env) {
       }
     }
 
-    // 🔥 2. تفكيك المعرف كلمة كلمة (Word by Word) بدون أي دمج لكلمتين
+    // تفكيك المعرف كلمة كلمة (Word by Word)
     if (!category && quizId) {
       const parts = quizId.split('_');
-      // إذا كان النمط القياسي: كلمة كلمة (category_subject_model)
       if (parts.length === 3) {
-        category = parts[0]; // كلمة واحدة صافية (مثل juniors أو grade9)
-        subject = parts[1];  // كلمة واحدة (مثل math)
-        model = parts[2];    // كلمة واحدة (مثل 1 أو random)
+        category = parts[0];
+        subject = parts[1];
+        model = parts[2];
       } else if (parts.length >= 4) {
-        // إذا كان هناك بادئة أولمبياد قديمة، نأخذ الكلمة المفردة الصافية مباشرة دون دمج
-        category = parts[1]; // تأخذ الكلمة المفردة: juniors / youth / grade10
-        subject = parts[2];  // المادة
-        model = parts[3];    // النموذج
+        category = parts[1];
+        subject = parts[2];
+        model = parts[3];
       }
     }
 
@@ -883,12 +866,14 @@ async function handleQuestionLookup(request, env) {
   const category = url.searchParams.get('category');
   const subject = url.searchParams.get('subject');
   const model = url.searchParams.get('model');
-  const qNum = parseInt(url.searchParams.get('question_number') || '0', 10);
+  const qNumRaw = url.searchParams.get('question_number');
+  const qNum = parseInt(qNumRaw || '0', 10);
 
-  if (!category || !subject || !model || !qNum) {
+  if (!category || !subject || !model || qNumRaw === null || isNaN(qNum)) {
     return errorResponse('معايير البحث غير مكتملة', 400);
   }
- try {
+
+  try {
     const stmt = await env.DB.prepare(`
       SELECT id, category, subject, model, question_number, text, options, correct, explanation, image, model_name, created_at
       FROM questions
@@ -909,15 +894,18 @@ async function handleQuestionLookup(request, env) {
     return errorResponse(e.message);
   }
 }
-
+    
+    return successResponse({ message: 'تم حذف الحساب بنجاح' });
+  } catch (e) {
+    return errorResponse(e.message);
+  }
+}
 // جلب سؤال مفرد بالرقم
 async function handleGetSingleQuestion(request, env, id) {
   let numericId = parseInt(id, 10);
 
-  // دعم تفكيك المعرف المفرد كلمة كلمة في حال تم إرساله كنص
   if (isNaN(numericId)) {
     const parts = id.split('_');
-    // متوقع نمط: category_subject_model_qNumber (كل جزء كلمة واحدة)
     if (parts.length >= 4) {
       const qnPart = parts[parts.length - 1].replace(/^q/, '');
       const mod = parts[parts.length - 2];
@@ -1143,7 +1131,7 @@ async function handlePosts(request, env) {
     }
   }
 
-  // GET: جلب المنشورات مع عدادات الإعجاب والتعليقات
+  // GET: جلب المنشورات
   if (request.method === 'GET') {
     try {
       const targetUserId = url.searchParams.get('userId') || url.searchParams.get('user_id');
@@ -1323,7 +1311,8 @@ async function handleResults(request, env) {
 
   return errorResponse('طريقة غير مدعومة', 405);
 }
-//لوحة المتصدرين
+
+// لوحة المتصدرين
 async function handleLeaderboard(request, env) {
   const url = new URL(request.url);
   const category = url.searchParams.get('category');
@@ -1337,7 +1326,7 @@ async function handleLeaderboard(request, env) {
              u.is_admin
       FROM users u
       LEFT JOIN results r ON u.id = r.user_id
-      WHERE (u.deleted_at IS NULL OR u.deleted_at = "")
+      WHERE (u.deleted_at IS NULL OR deleted_at = "")
     `;
     const params = [];
 
@@ -1420,7 +1409,6 @@ async function handleSearch(request, env) {
     return errorResponse(e.message);
   }
 }
-
 // ================================================================
 //  PART 5: البيانات الوصفية (Metadata)
 // ================================================================
@@ -1518,6 +1506,12 @@ async function handleMetadataManagement(request, env) {
         VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM metadata WHERE category = ? AND subject = ?))
       `).bind(category, subject, model, display_name, icon_class || null, category, subject).run();
 
+      // حذف الكاش لضمان ظهور التعديل فوراً
+      try {
+        const cache = caches.default;
+        await cache.delete(new Request(new URL('/api/metadata', request.url).toString()));
+      } catch (err) {}
+
       return successResponse({
         message: 'تم إضافة النموذج بنجاح',
         model: { category, subject, model, display_name, icon_class }
@@ -1533,6 +1527,13 @@ async function handleMetadataManagement(request, env) {
       if (!id) return errorResponse('معرف النموذج مطلوب');
 
       await env.DB.prepare('DELETE FROM metadata WHERE id = ?').bind(parseInt(id, 10)).run();
+
+      // حذف الكاش لضمان اختفاء النموذج المحذوف فوراً
+      try {
+        const cache = caches.default;
+        await cache.delete(new Request(new URL('/api/metadata', request.url).toString()));
+      } catch (err) {}
+
       return successResponse({ message: 'تم حذف النموذج بنجاح' });
     } catch (e) {
       return errorResponse(e.message);
@@ -1555,9 +1556,6 @@ export default {
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
-
-    // تهيئة الجداول وحقل bio في الخلفية
-    await autoHealSchema(env);
 
     try {
       // ===== 1. مسارات المستخدمين =====
