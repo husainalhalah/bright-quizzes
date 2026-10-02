@@ -1,8 +1,7 @@
 /**
  * ================================================================
- *  Bright Quizzes API - Cloudflare Worker
- *  الإصدار المتكامل: متوافق 100% مع كافة وظائف وسكربتات المنصة
- *  محدَّث ليدعم model_id عبر JOIN مع metadata
+ *  Bright Quizzes API - Cloudflare Worker (Full Metrics Engine)
+ *  الإصدار المتكامل: تخزين وجلب شامل لكافة إحصائيات الأسئلة والاختبارات
  * ================================================================
  */
 
@@ -96,7 +95,7 @@ function isValidEmail(email) {
   return re.test(String(email).toLowerCase());
 }
 
-async function checkRateLimit(env, key, limit = 5, windowSeconds = 300) {
+async function checkRateLimit(env, key, limit = 6, windowSeconds = 300) {
   if (!env.RATE_LIMIT) return true;
   const current = await env.RATE_LIMIT.get(key);
   const count = current ? parseInt(current, 10) : 0;
@@ -130,7 +129,7 @@ async function verifyToken(token, env) {
   if (!token) return null;
   try {
     const stmt = await env.DB.prepare(
-      `SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, is_admin, created_at, deleted_at
+      `SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, is_admin, score, created_at, deleted_at
        FROM users 
        WHERE token = ? 
        AND (deleted_at IS NULL OR deleted_at = "")
@@ -204,6 +203,7 @@ async function handleUserLogin(request, env) {
         school: user.school,
         age: user.age,
         avatar: user.avatar || null,
+        score: user.score || 0,
         is_admin: user.is_admin === 1 || user.is_admin === true || user.is_admin === '1',
         created_at: user.created_at
       }
@@ -237,8 +237,8 @@ async function handleUserSignup(request, env) {
     const token = generateToken();
 
     await env.DB.prepare(`
-      INSERT INTO users (username, full_name, email, password_hash, password_salt, age, governorate, school, badge, token, is_admin, created_at, token_expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, 0, datetime('now'), datetime('now', '+30 days'))
+      INSERT INTO users (username, full_name, email, password_hash, password_salt, age, governorate, school, badge, token, is_admin, score, created_at, token_expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, 0, 0, datetime('now'), datetime('now', '+30 days'))
     `).bind(
       username, full_name, email, passwordHash, salt,
       age || null, governorate || null, school || null, token
@@ -260,6 +260,7 @@ async function handleUserSignup(request, env) {
         school: school || null,
         age: age || null,
         avatar: null,
+        score: 0,
         is_admin: false,
         created_at: new Date().toISOString()
       }
@@ -287,11 +288,13 @@ async function handleUserMe(request, env) {
     school: user.school,
     age: user.age,
     avatar: user.avatar || null,
+    score: user.score || 0,
     is_admin: user.is_admin === 1 || user.is_admin === true || user.is_admin === '1',
     created_at: user.created_at
   });
 }
 
+// عرض ملف المستخدم الشخصي مع كامل إحصائياته الدقيقة من قاعدة البيانات
 async function handleUserProfileById(request, env) {
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
@@ -300,7 +303,7 @@ async function handleUserProfileById(request, env) {
   if (!id && !username) return errorResponse('معرف المستخدم أو اسم المستخدم مطلوب');
 
   try {
-    let query = 'SELECT id, username, full_name, bio, badge, governorate, school, age, avatar, is_admin, created_at FROM users WHERE (deleted_at IS NULL OR deleted_at = "")';
+    let query = 'SELECT id, username, full_name, bio, badge, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE (deleted_at IS NULL OR deleted_at = "")';
     let param = id ? parseInt(id, 10) : username;
     query += id ? ' AND id = ?' : ' AND username = ?';
 
@@ -308,14 +311,18 @@ async function handleUserProfileById(request, env) {
     const user = await stmt.first();
     if (!user) return errorResponse('المستخدم غير موجود', 404);
 
+    // حساب كافة إحصائيات هذا المستخدم من جدول results
     const statsStmt = await env.DB.prepare(`
       SELECT 
-        COUNT(*) as total_answers,
+        COUNT(*) as total_quizzes,
+        COALESCE(SUM(total), 0) as total_questions,
+        COALESCE(SUM(score), 0) as total_correct,
         COALESCE(AVG(percentage), 0) as avg_accuracy,
-        COALESCE(SUM(score), 0) as total_score
+        COALESCE(SUM(score * 10), 0) as total_score,
+        COALESCE(SUM(time_spent), 0) as total_duration
       FROM results WHERE user_id = ?
     `).bind(user.id);
-    const statsResult = await statsStmt.first();
+    const stats = await statsStmt.first();
 
     const followersStmt = await env.DB.prepare('SELECT COUNT(*) as count FROM follows WHERE following_id = ?').bind(user.id);
     const followers = await followersStmt.first();
@@ -324,12 +331,16 @@ async function handleUserProfileById(request, env) {
     const following = await followingStmt.first();
 
     let isFollowing = false;
+    let followsMe = false;
     const token = getAuthToken(request);
     if (token) {
       const viewer = await verifyToken(token, env);
       if (viewer && viewer.id !== user.id) {
         const followCheck = await env.DB.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').bind(viewer.id, user.id).first();
         isFollowing = !!followCheck;
+
+        const followsMeCheck = await env.DB.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').bind(user.id, viewer.id).first();
+        followsMe = !!followsMeCheck;
       }
     }
 
@@ -339,16 +350,22 @@ async function handleUserProfileById(request, env) {
       followers_count: followers?.count || 0,
       following_count: following?.count || 0,
       is_following: isFollowing,
+      follows_me: followsMe,
       stats: {
-        total_answers: statsResult?.total_answers || 0,
-        accuracy: Math.round(statsResult?.avg_accuracy || 0),
-        total_score: statsResult?.total_score || 0
+        total_quizzes: stats?.total_quizzes || 0,
+        total_questions: stats?.total_questions || 0,
+        correct_answers: stats?.total_correct || 0,
+        accuracy: Math.round(stats?.avg_accuracy || 0),
+        total_score: stats?.total_score || 0,
+        total_duration: stats?.total_duration || 0,
+        total_answers: stats?.total_questions || 0 // للتوافق العكسي مع الواجهات
       }
     });
   } catch (e) {
     return errorResponse(e.message);
   }
-  }
+}
+
 async function handleVerifyToken(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -366,6 +383,7 @@ async function handleVerifyToken(request, env) {
       bio: user.bio || null,
       badge: user.badge || 'none',
       avatar: user.avatar || null,
+      score: user.score || 0,
       is_admin: user.is_admin === 1 || user.is_admin === true || user.is_admin === '1'
     }
   });
@@ -410,6 +428,7 @@ async function handleRefreshToken(request, env) {
         school: user.school,
         age: user.age,
         avatar: user.avatar || null,
+        score: user.score || 0,
         is_admin: user.is_admin === 1 || user.is_admin === true || user.is_admin === '1',
         created_at: user.created_at
       }
@@ -417,8 +436,7 @@ async function handleRefreshToken(request, env) {
   } catch (e) {
     return errorResponse(e.message);
   }
-}
-
+      }
 async function handleAvatarUpload(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -444,7 +462,7 @@ async function handleAvatarUpload(request, env) {
     await env.DB.prepare('UPDATE users SET avatar = ? WHERE id = ?').bind(imageUrl, user.id).run();
 
     const updatedUser = await env.DB.prepare(
-      'SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, is_admin, created_at FROM users WHERE id = ?'
+      'SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE id = ?'
     ).bind(user.id).first();
 
     return successResponse({ user: { ...updatedUser, is_admin: updatedUser.is_admin === 1 } });
@@ -487,7 +505,7 @@ async function handleUserProfileUpdate(request, env) {
     ).run();
 
     const updatedUser = await env.DB.prepare(
-      'SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, is_admin, created_at FROM users WHERE id = ?'
+      'SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE id = ?'
     ).bind(user.id).first();
 
     return successResponse({ user: { ...updatedUser, is_admin: updatedUser.is_admin === 1 } });
@@ -530,7 +548,11 @@ async function handleUserLogout(request, env) {
   return successResponse({ message: 'تم تسجيل الخروج بنجاح' });
 }
 
-// معالجة إحصائيات المستخدم: جلب (GET) وحفظ نتائج الاختبارات (POST من quiz.js)
+/**
+ * ================================================================
+ *  معالجة إحصائيات المستخدم التفصيلية (حفظ وجلب شامل بدون افتراضات)
+ * ================================================================
+ */
 async function handleUserStats(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -538,43 +560,77 @@ async function handleUserStats(request, env) {
   const user = await verifyToken(token, env);
   if (!user) return errorResponse('توكن غير صالح', 401);
 
-  // POST: حفظ نتيجة اختبار واردة من محرك الاختبارات
+  // POST: حفظ كل بيانات جلسة الاختبار بالتفصيل الدقيق
   if (request.method === 'POST') {
     try {
       const body = await request.json();
       const quizId = body.quiz_id || 'custom';
+      
+      // الإجابات الصحيحة في هذا النموذج
       const correct = parseInt(body.correct_answers !== undefined ? body.correct_answers : body.score, 10) || 0;
+      // إجمالي أسئلة هذا النموذج
       const total = parseInt(body.total_questions !== undefined ? body.total_questions : body.total, 10) || 0;
-      const duration = parseInt(body.duration_seconds !== undefined ? body.duration_seconds : body.time_spent, 10) || null;
+      // الوقت المستغرق بالثواني لهذا النموذج
+      const duration = parseInt(body.duration_seconds !== undefined ? body.duration_seconds : body.time_spent, 10) || 0;
+      // الدقة لهذا النموذج
       const percentage = total > 0 ? Math.round((correct / total) * 100) : 0;
+      // سجل الإجابات التفصيلي
       const answers = body.answers ? JSON.stringify(body.answers) : '[]';
 
+      // 1. تسجيل النتيجة في جدول results
       await env.DB.prepare(`
         INSERT INTO results (user_id, quiz_id, score, total, percentage, answers, time_spent, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).bind(user.id, quizId, correct, total, percentage, answers, duration).run();
 
-      return successResponse({ message: 'تم حفظ النتيجة وتحديث الإحصائيات بنجاح' });
+      // 2. تحديث رصيد النقاط الإجمالي للمستخدم في جدول users مباشرة (10 نقاط لكل سؤال صحيح)
+      await env.DB.prepare(`
+        UPDATE users 
+        SET score = (SELECT COALESCE(SUM(score * 10), 0) FROM results WHERE user_id = ?)
+        WHERE id = ?
+      `).bind(user.id, user.id).run();
+
+      return successResponse({ 
+        message: 'تم حفظ كافة بيانات النموذج وتحديث الإحصائيات بنجاح',
+        saved: {
+          quiz_id: quizId,
+          correct_answers: correct,
+          total_questions: total,
+          percentage,
+          duration_seconds: duration
+        }
+      });
     } catch (e) {
       return errorResponse(e.message);
     }
   }
 
-  // GET: إرجاع إحصائيات الأقسام بدقة
+  // GET: جلب كافة الإحصائيات المحسوبة من قاعدة البيانات مباشرة
   if (request.method === 'GET') {
     try {
+      // 1. الإحصائيات التراكمية الكلية للمستخدم
       const statsStmt = await env.DB.prepare(`
         SELECT 
-          COUNT(*) as total_answers,
+          COUNT(*) as total_quizzes,
+          COALESCE(SUM(total), 0) as total_questions,
+          COALESCE(SUM(score), 0) as total_correct,
           COALESCE(AVG(percentage), 0) as avg_accuracy,
-          COALESCE(SUM(score), 0) as total_score
+          COALESCE(SUM(score * 10), 0) as total_score,
+          COALESCE(SUM(time_spent), 0) as total_duration
         FROM results 
         WHERE user_id = ?
       `).bind(user.id);
       const stats = await statsStmt.first();
 
+      // 2. تفصيل كل قسم تعليمي (عدد النماذج، الأسئلة، الدقة، والوقت)
       const catStmt = await env.DB.prepare(`
-        SELECT quiz_id, COUNT(*) as count, AVG(percentage) as avg
+        SELECT 
+          quiz_id, 
+          COUNT(*) as quizzes_count, 
+          SUM(total) as total_questions,
+          SUM(score) as total_correct,
+          AVG(percentage) as avg_accuracy,
+          SUM(time_spent) as total_duration
         FROM results
         WHERE user_id = ?
         GROUP BY quiz_id
@@ -599,24 +655,53 @@ async function handleUserStats(request, env) {
         const rootName = labelMap[singleWordKey] || singleWordKey;
 
         if (!grouped[singleWordKey]) {
-          grouped[singleWordKey] = { id: singleWordKey, name: rootName, total_score: 0, count: 0 };
+          grouped[singleWordKey] = {
+            id: singleWordKey,
+            name: rootName,
+            quizzes_count: 0,
+            total_questions: 0,
+            correct_answers: 0,
+            total_score_sum: 0,
+            duration_seconds: 0
+          };
         }
-        grouped[singleWordKey].total_score += (c.avg * c.count);
-        grouped[singleWordKey].count += c.count;
+        grouped[singleWordKey].quizzes_count += c.quizzes_count;
+        grouped[singleWordKey].total_questions += c.total_questions;
+        grouped[singleWordKey].correct_answers += c.total_correct;
+        grouped[singleWordKey].total_score_sum += (c.avg_accuracy * c.quizzes_count);
+        grouped[singleWordKey].duration_seconds += (c.total_duration || 0);
       });
 
       const categories = Object.values(grouped).map(g => ({
         id: g.id,
         name: g.name,
-        progress: Math.round(g.count > 0 ? (g.total_score / g.count) : 0),
-        questions: g.count
+        progress: Math.round(g.quizzes_count > 0 ? (g.total_score_sum / g.quizzes_count) : 0),
+        quizzes: g.quizzes_count,
+        questions: g.total_questions,
+        correct: g.correct_answers,
+        duration: g.duration_seconds
       }));
 
+      // 3. أحدث النماذج التي خاضها الطالب مع نتيجتها ووقتها
+      const recentStmt = await env.DB.prepare(`
+        SELECT id, quiz_id, score as correct_answers, total as total_questions, percentage as accuracy, time_spent as duration_seconds, created_at
+        FROM results
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 10
+      `).bind(user.id);
+      const recent = await recentStmt.all();
+
       return successResponse({
-        total_answers: stats?.total_answers || 0,
-        accuracy: Math.round(stats?.avg_accuracy || 0),
-        total_score: stats?.total_score || 0,
-        categories
+        total_quizzes: stats?.total_quizzes || 0,        // إجمالي الاختبارات المكتملة
+        total_questions: stats?.total_questions || 0,    // إجمالي الأسئلة المحلولة
+        correct_answers: stats?.total_correct || 0,      // إجمالي الإجابات الصحيحة
+        accuracy: Math.round(stats?.avg_accuracy || 0),  // نسبة الدقة الإجمالية
+        total_score: stats?.total_score || 0,            // مجموع النقاط التراكمية
+        total_duration: stats?.total_duration || 0,      // إجمالي وقت الحل بالثواني
+        total_answers: stats?.total_questions || 0,      // للتوافق العكسي مع الواجهات السابقة
+        categories,
+        recent_quizzes: recent.results
       });
     } catch (e) {
       return errorResponse(e.message);
@@ -737,7 +822,8 @@ async function handleFollowingList(request, env, userId) {
   } catch (e) {
     return errorResponse(e.message);
   }
-  }
+}
+
 // ================================================================
 //  PART 3: إدارة بنك الأسئلة (يدعم model_id عبر JOIN مع metadata)
 // ================================================================
@@ -788,7 +874,6 @@ async function handleQuestions(request, env) {
         return errorResponse('جميع الحقول المطلوبة يجب تعبئتها');
       }
 
-      // ★ جلب model_id من جدول metadata
       const metaRow = await env.DB.prepare(
         'SELECT id FROM metadata WHERE category = ? AND subject = ? AND model = ? LIMIT 1'
       ).bind(category, subject, model).first();
@@ -804,7 +889,6 @@ async function handleQuestions(request, env) {
         imageUrl = await storeImage(env, imageData, key, url.origin);
       }
 
-      // التحقق هل السؤال مضاف مسبقاً لنفس النموذج والترتيب
       const existing = await env.DB.prepare(`
         SELECT id FROM questions 
         WHERE category = ? AND subject = ? AND model_id = ? AND question_number = ? AND (deleted_at IS NULL OR deleted_at = "")
@@ -836,8 +920,8 @@ async function handleQuestions(request, env) {
     } catch (e) {
       return errorResponse(e.message);
     }
-  }
-
+          }
+  
   // GET: جلب أسئلة الاختبار
   if (request.method === 'GET') {
     let category = url.searchParams.get('category');
@@ -846,7 +930,6 @@ async function handleQuestions(request, env) {
     const quizId = url.searchParams.get('quiz') || url.searchParams.get('quizId');
     const mixed = url.searchParams.get('mixed');
 
-    // دعم الاختبارات العشوائية المختلطة
     if (mixed) {
       try {
         let mixedQuery = `
@@ -880,7 +963,6 @@ async function handleQuestions(request, env) {
       }
     }
 
-    // تفكيك المعرف المركب إلى عناصره الأساسية (category_subject_model)
     if (!category && quizId) {
       const parts = quizId.split('_');
       if (parts.length >= 3) {
@@ -933,7 +1015,6 @@ async function handleQuestions(request, env) {
   return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// دالة تفكيك المعرف للبحث الرقمي أو المركب (محدَّثة لـ JOIN)
 async function resolveQuestionRow(idStr, env) {
   const numericId = parseInt(idStr, 10);
   if (!isNaN(numericId)) {
@@ -945,7 +1026,6 @@ async function resolveQuestionRow(idStr, env) {
     `).bind(numericId).first();
   }
 
-  // تجزئة المعرف المركب: juniors_science_model1_q5
   const parts = idStr.split('_');
   if (parts.length < 4) return null;
 
@@ -967,7 +1047,6 @@ async function resolveQuestionRow(idStr, env) {
   `).bind(category, subject, model, questionNumber).first();
 }
 
-// جلب سؤال محدد
 async function handleGetSingleQuestion(request, env, id) {
   try {
     const question = await resolveQuestionRow(id, env);
@@ -983,7 +1062,6 @@ async function handleGetSingleQuestion(request, env, id) {
   }
 }
 
-// تحديث سؤال محدد بالمعرف الرقمي أو المركب (محدَّث لـ model_id)
 async function handleQuestionFullUpdate(request, env, id) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -1032,7 +1110,6 @@ async function handleQuestionFullUpdate(request, env, id) {
       return errorResponse('جميع الحقول المطلوبة يجب تعبئتها');
     }
 
-    // ★ جلب model_id من metadata
     const metaRow = await env.DB.prepare(
       'SELECT id FROM metadata WHERE category = ? AND subject = ? AND model = ? LIMIT 1'
     ).bind(category, subject, model).first();
@@ -1082,7 +1159,6 @@ async function handleQuestionFullUpdate(request, env, id) {
   }
 }
 
-// حذف سؤال بالمعرف الرقمي أو المركب
 async function handleQuestionDelete(request, env, id) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -1104,15 +1180,15 @@ async function handleQuestionDelete(request, env, id) {
   } catch (e) {
     return errorResponse(e.message);
   }
-          }
+}
+
 // ================================================================
-//  PART 4: المجتمع، التفاعل (الإعجابات والتعليقات) والمتصدرين
+//  PART 4: المجتمع، التفاعل والمتصدرين المحدثين
 // ================================================================
 
 async function handlePosts(request, env) {
   const url = new URL(request.url);
 
-  // POST: نشر منشور جديد
   if (request.method === 'POST') {
     const token = getAuthToken(request);
     if (!token) return errorResponse('غير مصرح', 401);
@@ -1161,7 +1237,6 @@ async function handlePosts(request, env) {
     }
   }
 
-  // GET: جلب المنشورات
   if (request.method === 'GET') {
     try {
       const targetUserId = url.searchParams.get('userId') || url.searchParams.get('user_id');
@@ -1212,7 +1287,6 @@ async function handlePosts(request, env) {
   return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// تبديل الإعجاب (Toggle Like)
 async function handlePostLike(request, env, postId) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -1246,7 +1320,6 @@ async function handlePostLike(request, env, postId) {
   }
 }
 
-// قائمة المعجبين بمنشور محدد (Likers Modal)
 async function handlePostLikers(request, env, postId) {
   const pId = parseInt(postId, 10);
   if (isNaN(pId)) return errorResponse('معرف المنشور غير صحيح');
@@ -1272,7 +1345,6 @@ async function handlePostLikers(request, env, postId) {
   }
 }
 
-// التعليقات على المنشور
 async function handlePostComments(request, env, postId) {
   const pId = parseInt(postId, 10);
   if (isNaN(pId)) return errorResponse('معرف المنشور غير صحيح');
@@ -1327,7 +1399,6 @@ async function handlePostComments(request, env, postId) {
   return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// مسار النتائج (Results)
 async function handleResults(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -1363,23 +1434,28 @@ async function handleResults(request, env) {
     } catch (e) {
       return errorResponse(e.message);
     }
-  }
-
+      }
   return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// لوحة المتصدرين الشاملة
+/**
+ * ================================================================
+ *  لوحة المتصدرين الشاملة والمحدثة بالكامل مع كافة البيانات الحقيقية
+ * ================================================================
+ */
 async function handleLeaderboard(request, env) {
   const url = new URL(request.url);
   const category = url.searchParams.get('category');
 
   try {
     let query = `
-      SELECT u.id, u.username, u.full_name, u.badge, u.avatar,
+      SELECT u.id, u.username, u.full_name, u.badge, u.avatar, u.is_admin,
              COUNT(r.id) as total_quizzes,
-             COALESCE(AVG(r.percentage), 0) as avg_score,
-             COALESCE(SUM(r.score), 0) as total_points,
-             u.is_admin
+             COALESCE(SUM(r.total), 0) as total_questions,
+             COALESCE(SUM(r.score), 0) as total_correct,
+             COALESCE(SUM(r.score * 10), 0) as total_points,
+             COALESCE(AVG(r.percentage), 0) as avg_accuracy,
+             COALESCE(SUM(r.time_spent), 0) as total_duration
       FROM users u
       LEFT JOIN results r ON u.id = r.user_id
       WHERE (u.deleted_at IS NULL OR u.deleted_at = "")
@@ -1397,11 +1473,12 @@ async function handleLeaderboard(request, env) {
       }
     }
 
-    query += ` GROUP BY u.id HAVING total_quizzes > 0 ORDER BY avg_score DESC, total_points DESC LIMIT 100`;
+    query += ` GROUP BY u.id HAVING total_quizzes > 0 ORDER BY total_points DESC, avg_accuracy DESC LIMIT 100`;
 
     const stmt = await env.DB.prepare(query).bind(...params);
     const data = await stmt.all();
 
+    // إرجاع كل الحقول المحسوبة من قاعدة البيانات بدون أي أصفار مصطنعة
     const leaderboard = data.results.map(u => ({
       id: u.id,
       username: u.username,
@@ -1409,8 +1486,12 @@ async function handleLeaderboard(request, env) {
       badge: u.badge || 'none',
       avatar: u.avatar || null,
       is_admin: u.is_admin === 1 || u.is_admin === true || u.is_admin === '1',
-      score: Math.round(u.total_points || 0),
-      accuracy: Math.round(u.avg_score || 0)
+      score: Math.round(u.total_points || 0),           // إجمالي النقاط (10 نقاط لكل سؤال صحيح)
+      total_quizzes: u.total_quizzes || 0,             // عدد الاختبارات المنجزة
+      total_questions: u.total_questions || 0,         // إجمالي الأسئلة التي خاضها
+      correct_answers: u.total_correct || 0,           // مجموع الإجابات الصحيحة
+      accuracy: Math.round(u.avg_accuracy || 0),       // متوسط نسبة الدقة
+      duration_seconds: u.total_duration || 0          // إجمالي الوقت المستغرق بالثواني
     }));
 
     return successResponse({ leaderboard });
@@ -1419,7 +1500,6 @@ async function handleLeaderboard(request, env) {
   }
 }
 
-// محرك البحث الشامل (محدَّث بـ JOIN مع metadata)
 async function handleSearch(request, env) {
   const url = new URL(request.url);
   const query = url.searchParams.get('q');
@@ -1471,7 +1551,8 @@ async function handleSearch(request, env) {
   } catch (e) {
     return errorResponse(e.message);
   }
-  }
+}
+
 // ================================================================
 //  PART 5: البيانات الوصفية (Metadata)
 // ================================================================
@@ -1588,7 +1669,6 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // التعامل مع خيارات CORS التمهيدية
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
@@ -1607,14 +1687,12 @@ export default {
       if (path === '/api/users/delete' && method === 'DELETE') return await handleUserDelete(request, env);
       if (path === '/api/users/stats' && (method === 'GET' || method === 'POST')) return await handleUserStats(request, env);
 
-      // مسار منشورات مستخدم معين لصفحة البروفايل
       if (path.match(/^\/api\/users\/(\d+)\/posts$/) && method === 'GET') {
         const id = path.split('/')[3];
         url.searchParams.set('userId', id);
         return await handlePosts(new Request(url.toString(), request), env);
       }
 
-      // مسارات المتابعة المرنة
       if (path === '/api/users/follow' && method === 'POST') return await handleFollow(request, env);
       if (path.match(/^\/api\/users\/(\d+)\/follow$/) && method === 'POST') {
         const targetId = path.split('/')[3];
@@ -1694,11 +1772,6 @@ export default {
             ...corsHeaders()
           }
         });
-      }
-
-      // المسار الافتراضي للصحة
-      if (path === '/' || path === '') {
-        return new Response('Bright Quizzes API is running cleanly and fully compatible!', { headers: corsHeaders() });
       }
 
       return errorResponse('المسار غير موجود', 404);
