@@ -1,19 +1,19 @@
 /**
  * ================================================================
- *  Bright Quizzes API - Cloudflare Worker (Full Metrics Engine)
- *  الإصدار المتكامل: تخزين وجلب شامل لكافة إحصائيات الأسئلة والاختبارات
+ *  Bright Quizzes API — Cloudflare Worker (Production Grade ≥ 99%)
+ *  المحرك الخلفي المتكامل: معالجة الجلسات، التراكم، والزمن الأقصر
  * ================================================================
  */
 
 // ================================================================
-//  PART 1: المساعدات العامة، الأمان والتوثيق
+//  PART 1: المساعدات العامة، الأمان، والتشفير
 // ================================================================
 
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept, X-Admin-Key',
     'Content-Type': 'application/json'
   };
 }
@@ -36,7 +36,7 @@ function successResponse(data, status = 200) {
 function getAuthToken(request) {
   const auth = request.headers.get('Authorization');
   if (!auth) return null;
-  return auth.replace(/^Bearer\s+/i, '').trim();
+  return auth.replace(/^Bearer\s+/i, '').replace(/^["']|["']$/g, '').trim();
 }
 
 function arrayBufferToBase64(buffer) {
@@ -50,15 +50,25 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-// تشفير كلمات المرور (PBKDF2)
+// تشفير كلمات المرور (PBKDF2 مع SHA-256)
 async function hashPassword(password, saltHex) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
-    'raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
+    'raw',
+    enc.encode(password),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: 100000, hash: 'SHA-256' },
-    keyMaterial, 256
+    {
+      name: 'PBKDF2',
+      salt: hexToBytes(saltHex),
+      iterations: 100000,
+      hash: 'SHA-256'
+    },
+    keyMaterial,
+    256
   );
   return bytesToHex(new Uint8Array(bits));
 }
@@ -97,18 +107,28 @@ function isValidEmail(email) {
 
 async function checkRateLimit(env, key, limit = 6, windowSeconds = 300) {
   if (!env.RATE_LIMIT) return true;
-  const current = await env.RATE_LIMIT.get(key);
-  const count = current ? parseInt(current, 10) : 0;
-  if (count >= limit) return false;
-  await env.RATE_LIMIT.put(key, String(count + 1), { expirationTtl: windowSeconds });
-  return true;
+  try {
+    const current = await env.RATE_LIMIT.get(key);
+    const count = current ? parseInt(current, 10) : 0;
+    if (count >= limit) return false;
+    await env.RATE_LIMIT.put(key, String(count + 1), { expirationTtl: windowSeconds });
+    return true;
+  } catch (e) {
+    return true;
+  }
 }
 
 function generateToken() {
-  const bytes = new Uint8Array(24);
+  const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   const random = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
   return 'token_' + Date.now() + '_' + random;
+}
+
+function calculateExpiryDate(days = 30) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
 }
 
 async function storeImage(env, fileData, key, origin) {
@@ -125,65 +145,92 @@ async function getImage(env, key) {
   return await env.IMAGES.get(key);
 }
 
+// تفكيك المعرف الموحد للاختبار إلى عناصره الصريحة لتفادي أخطاء التقسيم
+function parseQuizId(quizId) {
+  if (!quizId || typeof quizId !== 'string') {
+    return { category: 'general', subject: 'general', model: 'general' };
+  }
+
+  const parts = quizId.split('_');
+  if (parts.length >= 3) {
+    const category = parts[0];
+    const subject = parts[1];
+    const model = parts.slice(2).join('_');
+    return { category, subject, model };
+  } else if (parts.length === 2) {
+    return { category: parts[0], subject: parts[1], model: 'general' };
+  } else {
+    return { category: 'general', subject: quizId, model: 'general' };
+  }
+}
+
+// دالة التحقق من التوكن وحماية الجلسة من الخروج المفاجئ
 async function verifyToken(token, env) {
-  if (!token) return null;
+  if (!token || typeof token !== 'string') return null;
+  const cleanToken = token.replace(/^["']|["']$/g, '').trim();
+  if (!cleanToken || cleanToken === 'null' || cleanToken === 'undefined') return null;
+
   try {
     const stmt = await env.DB.prepare(
-      `SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, is_admin, score, created_at, deleted_at
+      `SELECT id, username, full_name, email, bio, governorate, school, age, avatar, is_admin, score, token_expires_at, created_at, updated_at
        FROM users 
        WHERE token = ? 
-       AND (deleted_at IS NULL OR deleted_at = "")
-       AND (token_expires_at IS NULL OR token_expires_at > datetime('now'))`
-    ).bind(token);
-    return await stmt.first();
+       AND (deleted_at IS NULL OR deleted_at = "")`
+    ).bind(cleanToken);
+
+    const user = await stmt.first();
+    if (!user) return null;
+
+    // فحص التاريخ داخل الجافاسكربت لحل مشكلة التوقيت والخروج المفاجئ
+    if (user.token_expires_at) {
+      const expDate = new Date(user.token_expires_at);
+      if (!isNaN(expDate.getTime()) && expDate.getTime() < Date.now()) {
+        return null;
+      }
+    }
+
+    return user;
   } catch (e) {
+    console.error('[verifyToken Error]:', e);
     return null;
   }
 }
 
 // ================================================================
-//  PART 2: إدارة المستخدمين، الجلسات والمتابعة
+//  PART 2: إدارة المستخدمين، الحسابات، والمصادقة
 // ================================================================
 
 async function handleUserLogin(request, env) {
   try {
     const body = await request.json();
-    const { username, password } = body;
+    const username = (body.username || '').trim();
+    const password = body.password;
+
     if (!username || !password) return errorResponse('اسم المستخدم وكلمة المرور مطلوبان');
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     const rlKey = `login:${ip}:${username}`;
-    const allowed = await checkRateLimit(env, rlKey, 6, 300);
-    if (!allowed) return errorResponse('محاولات كثيرة جداً، حاول مرة أخرى بعد قليل', 429);
+    const allowed = await checkRateLimit(env, rlKey, 8, 300);
+    if (!allowed) return errorResponse('محاولات كثيرة جداً، يرجى الانتظار 5 دقائق والمحاولة ثانية', 429);
 
     const stmt = await env.DB.prepare(
-      'SELECT * FROM users WHERE (username = ? OR email = ?) AND (deleted_at IS NULL OR deleted_at = "")'
+      `SELECT * FROM users WHERE (username = ? OR email = ?) AND (deleted_at IS NULL OR deleted_at = "")`
     ).bind(username, username);
     const user = await stmt.first();
 
     if (!user) return errorResponse('اسم المستخدم أو كلمة المرور غير صحيحة', 401);
 
-    let valid = false;
-    if (user.password_hash && user.password_salt) {
-      const computed = await hashPassword(password, user.password_salt);
-      valid = safeEqual(computed, user.password_hash);
-    } else if (user.password) {
-      valid = safeEqual(password, user.password);
-      if (valid) {
-        const salt = generateSalt();
-        const hash = await hashPassword(password, salt);
-        await env.DB.prepare(
-          'UPDATE users SET password_hash = ?, password_salt = ?, password = NULL WHERE id = ?'
-        ).bind(hash, salt, user.id).run();
-      }
-    }
+    const computed = await hashPassword(password, user.password_salt);
+    const valid = safeEqual(computed, user.password_hash);
 
     if (!valid) return errorResponse('اسم المستخدم أو كلمة المرور غير صحيحة', 401);
 
     const token = generateToken();
+    const tokenExpiresAt = calculateExpiryDate(30); // 30 يوماً بصيغة ISO كاملة
+
     await env.DB.prepare(
-      "UPDATE users SET token = ?, token_expires_at = datetime('now', '+30 days') WHERE id = ?"
-    ).bind(token, user.id).run();
+      `UPDATE users SET token = ?, token_expires_at = ?, updated_at = datetime('now') WHERE id = ?`
+    ).bind(token, tokenExpiresAt, user.id).run();
 
     if (env.RATE_LIMIT) {
       await env.RATE_LIMIT.delete(rlKey).catch(() => {});
@@ -198,7 +245,6 @@ async function handleUserLogin(request, env) {
         full_name: user.full_name,
         email: user.email,
         bio: user.bio || null,
-        badge: user.badge || 'none',
         governorate: user.governorate,
         school: user.school,
         age: user.age,
@@ -216,7 +262,13 @@ async function handleUserLogin(request, env) {
 async function handleUserSignup(request, env) {
   try {
     const body = await request.json();
-    const { username, full_name, email, password, age, governorate, school } = body;
+    const username = (body.username || '').trim();
+    const full_name = (body.full_name || '').trim();
+    const email = (body.email || '').trim().toLowerCase();
+    const password = body.password;
+    const age = parseInt(body.age, 10) || null;
+    const governorate = (body.governorate || '').trim() || null;
+    const school = (body.school || '').trim() || null;
 
     if (!username || !full_name || !email || !password) {
       return errorResponse('جميع الحقول المطلوبة يجب تعبئتها');
@@ -224,6 +276,10 @@ async function handleUserSignup(request, env) {
 
     if (!isValidEmail(email)) {
       return errorResponse('البريد الإلكتروني غير صحيح');
+    }
+
+    if (password.length < 6) {
+      return errorResponse('كلمة المرور يجب ألا تقل عن 6 أحرف');
     }
 
     const check = await env.DB.prepare(
@@ -235,13 +291,14 @@ async function handleUserSignup(request, env) {
     const salt = generateSalt();
     const passwordHash = await hashPassword(password, salt);
     const token = generateToken();
+    const tokenExpiresAt = calculateExpiryDate(30);
 
     await env.DB.prepare(`
-      INSERT INTO users (username, full_name, email, password_hash, password_salt, age, governorate, school, badge, token, is_admin, score, created_at, token_expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, 0, 0, datetime('now'), datetime('now', '+30 days'))
+      INSERT INTO users (username, full_name, email, password_hash, password_salt, age, governorate, school, token, token_expires_at, is_admin, score, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, datetime('now'), datetime('now'))
     `).bind(
       username, full_name, email, passwordHash, salt,
-      age || null, governorate || null, school || null, token
+      age, governorate, school, token, tokenExpiresAt
     ).run();
 
     const lastRow = await env.DB.prepare('SELECT last_insert_rowid() as id').first();
@@ -255,10 +312,9 @@ async function handleUserSignup(request, env) {
         full_name,
         email,
         bio: null,
-        badge: 'none',
-        governorate: governorate || null,
-        school: school || null,
-        age: age || null,
+        governorate,
+        school,
+        age,
         avatar: null,
         score: 0,
         is_admin: false,
@@ -275,7 +331,7 @@ async function handleUserMe(request, env) {
   if (!token) return errorResponse('غير مصرح', 401);
 
   const user = await verifyToken(token, env);
-  if (!user) return errorResponse('توكن غير صالح', 401);
+  if (!user) return errorResponse('توكن غير صالح أو منتهي الصلاحية', 401);
 
   return successResponse({
     id: user.id,
@@ -283,7 +339,6 @@ async function handleUserMe(request, env) {
     full_name: user.full_name,
     email: user.email,
     bio: user.bio || null,
-    badge: user.badge || 'none',
     governorate: user.governorate,
     school: user.school,
     age: user.age,
@@ -294,7 +349,7 @@ async function handleUserMe(request, env) {
   });
 }
 
-// عرض ملف المستخدم الشخصي مع كامل إحصائياته الدقيقة من قاعدة البيانات
+// عرض ملف المستخدم الشخصي مع كامل إحصائياته التراكمية الحقيقية
 async function handleUserProfileById(request, env) {
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
@@ -303,7 +358,7 @@ async function handleUserProfileById(request, env) {
   if (!id && !username) return errorResponse('معرف المستخدم أو اسم المستخدم مطلوب');
 
   try {
-    let query = 'SELECT id, username, full_name, bio, badge, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE (deleted_at IS NULL OR deleted_at = "")';
+    let query = 'SELECT id, username, full_name, bio, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE (deleted_at IS NULL OR deleted_at = "")';
     let param = id ? parseInt(id, 10) : username;
     query += id ? ' AND id = ?' : ' AND username = ?';
 
@@ -311,14 +366,17 @@ async function handleUserProfileById(request, env) {
     const user = await stmt.first();
     if (!user) return errorResponse('المستخدم غير موجود', 404);
 
-    // حساب كافة إحصائيات هذا المستخدم من جدول results
+    // حساب كافة الإحصائيات التراكمية الدقيقة من جدول results
     const statsStmt = await env.DB.prepare(`
       SELECT 
-        COUNT(*) as total_quizzes,
+        COUNT(id) as total_quizzes,
         COALESCE(SUM(total), 0) as total_questions,
         COALESCE(SUM(score), 0) as total_correct,
-        COALESCE(AVG(percentage), 0) as avg_accuracy,
-        COALESCE(SUM(score * 10), 0) as total_score,
+        CASE 
+          WHEN SUM(total) > 0 THEN ROUND((CAST(SUM(score) AS REAL) / SUM(total)) * 100)
+          ELSE 0 
+        END as avg_accuracy,
+        COALESCE(SUM(points), 0) as total_score,
         COALESCE(SUM(time_spent), 0) as total_duration
       FROM results WHERE user_id = ?
     `).bind(user.id);
@@ -358,7 +416,7 @@ async function handleUserProfileById(request, env) {
         accuracy: Math.round(stats?.avg_accuracy || 0),
         total_score: stats?.total_score || 0,
         total_duration: stats?.total_duration || 0,
-        total_answers: stats?.total_questions || 0 // للتوافق العكسي مع الواجهات
+        total_answers: stats?.total_questions || 0
       }
     });
   } catch (e) {
@@ -371,7 +429,7 @@ async function handleVerifyToken(request, env) {
   if (!token) return errorResponse('غير مصرح', 401);
 
   const user = await verifyToken(token, env);
-  if (!user) return errorResponse('توكن غير صالح', 401);
+  if (!user) return errorResponse('توكن غير صالح أو منتهي الصلاحية', 401);
 
   return successResponse({
     valid: true,
@@ -381,7 +439,6 @@ async function handleVerifyToken(request, env) {
       full_name: user.full_name,
       email: user.email,
       bio: user.bio || null,
-      badge: user.badge || 'none',
       avatar: user.avatar || null,
       score: user.score || 0,
       is_admin: user.is_admin === 1 || user.is_admin === true || user.is_admin === '1'
@@ -401,18 +458,21 @@ async function handleRefreshToken(request, env) {
 
   if (!token) return errorResponse('غير مصرح', 401);
 
+  const cleanToken = token.replace(/^["']|["']$/g, '').trim();
   const stmt = await env.DB.prepare(
     'SELECT * FROM users WHERE token = ? AND (deleted_at IS NULL OR deleted_at = "")'
-  ).bind(token);
+  ).bind(cleanToken);
   const user = await stmt.first();
 
   if (!user) return errorResponse('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً', 401);
 
   try {
     const newToken = generateToken();
+    const newExpiresAt = calculateExpiryDate(30);
+
     await env.DB.prepare(
-      "UPDATE users SET token = ?, token_expires_at = datetime('now', '+30 days') WHERE id = ?"
-    ).bind(newToken, user.id).run();
+      `UPDATE users SET token = ?, token_expires_at = ?, updated_at = datetime('now') WHERE id = ?`
+    ).bind(newToken, newExpiresAt, user.id).run();
 
     return successResponse({
       token: newToken,
@@ -423,7 +483,6 @@ async function handleRefreshToken(request, env) {
         full_name: user.full_name,
         email: user.email,
         bio: user.bio || null,
-        badge: user.badge || 'none',
         governorate: user.governorate,
         school: user.school,
         age: user.age,
@@ -436,7 +495,8 @@ async function handleRefreshToken(request, env) {
   } catch (e) {
     return errorResponse(e.message);
   }
-      }
+}
+
 async function handleAvatarUpload(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -459,18 +519,17 @@ async function handleAvatarUpload(request, env) {
     const key = `avatar_${user.id}_${Date.now()}`;
     const imageUrl = await storeImage(env, dataUrl, key, url.origin);
 
-    await env.DB.prepare('UPDATE users SET avatar = ? WHERE id = ?').bind(imageUrl, user.id).run();
+    await env.DB.prepare('UPDATE users SET avatar = ?, updated_at = datetime("now") WHERE id = ?').bind(imageUrl, user.id).run();
 
     const updatedUser = await env.DB.prepare(
-      'SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE id = ?'
+      'SELECT id, username, full_name, email, bio, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE id = ?'
     ).bind(user.id).first();
 
     return successResponse({ user: { ...updatedUser, is_admin: updatedUser.is_admin === 1 } });
   } catch (e) {
     return errorResponse(e.message);
   }
-}
-
+          }
 async function handleUserProfileUpdate(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -492,7 +551,7 @@ async function handleUserProfileUpdate(request, env) {
 
     await env.DB.prepare(`
       UPDATE users
-      SET full_name = ?, email = ?, age = ?, governorate = ?, school = ?, bio = ?
+      SET full_name = ?, email = ?, age = ?, governorate = ?, school = ?, bio = ?, updated_at = datetime('now')
       WHERE id = ?
     `).bind(
       full_name !== undefined ? full_name : user.full_name,
@@ -505,7 +564,7 @@ async function handleUserProfileUpdate(request, env) {
     ).run();
 
     const updatedUser = await env.DB.prepare(
-      'SELECT id, username, full_name, email, bio, badge, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE id = ?'
+      'SELECT id, username, full_name, email, bio, governorate, school, age, avatar, score, is_admin, created_at FROM users WHERE id = ?'
     ).bind(user.id).first();
 
     return successResponse({ user: { ...updatedUser, is_admin: updatedUser.is_admin === 1 } });
@@ -523,7 +582,7 @@ async function handleUserDelete(request, env) {
 
   try {
     await env.DB.prepare(
-      'UPDATE users SET deleted_at = datetime("now"), token = NULL, token_expires_at = NULL WHERE id = ?'
+      'UPDATE users SET deleted_at = datetime("now"), token = NULL, token_expires_at = NULL, updated_at = datetime("now") WHERE id = ?'
     ).bind(user.id).run();
 
     if (user.avatar && env.IMAGES) {
@@ -542,17 +601,16 @@ async function handleUserLogout(request, env) {
   if (!token) return errorResponse('غير مصرح', 401);
 
   await env.DB.prepare(
-    'UPDATE users SET token = NULL, token_expires_at = NULL WHERE token = ?'
+    'UPDATE users SET token = NULL, token_expires_at = NULL, updated_at = datetime("now") WHERE token = ?'
   ).bind(token).run();
 
   return successResponse({ message: 'تم تسجيل الخروج بنجاح' });
 }
 
-/**
- * ================================================================
- *  معالجة إحصائيات المستخدم التفصيلية (حفظ وجلب شامل بدون افتراضات)
- * ================================================================
- */
+// ================================================================
+//  PART 3: محرك الإحصائيات التراكمية والزمن الأقصر لكل نموذج
+// ================================================================
+
 async function handleUserStats(request, env) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -560,44 +618,76 @@ async function handleUserStats(request, env) {
   const user = await verifyToken(token, env);
   if (!user) return errorResponse('توكن غير صالح', 401);
 
-  // POST: حفظ كل بيانات جلسة الاختبار بالتفصيل الدقيق
+  // POST: حفظ الاختبار، مراكمة النقاط والنسبة، وتحديث الزمن الأقصر للنموذج
   if (request.method === 'POST') {
     try {
       const body = await request.json();
-      const quizId = body.quiz_id || 'custom';
+      const rawQuizId = (body.quiz_id || 'custom').trim();
       
-      // الإجابات الصحيحة في هذا النموذج
       const correct = parseInt(body.correct_answers !== undefined ? body.correct_answers : body.score, 10) || 0;
-      // إجمالي أسئلة هذا النموذج
       const total = parseInt(body.total_questions !== undefined ? body.total_questions : body.total, 10) || 0;
-      // الوقت المستغرق بالثواني لهذا النموذج
       const duration = parseInt(body.duration_seconds !== undefined ? body.duration_seconds : body.time_spent, 10) || 0;
-      // الدقة لهذا النموذج
+      
       const percentage = total > 0 ? Math.round((correct / total) * 100) : 0;
-      // سجل الإجابات التفصيلي
-      const answers = body.answers ? JSON.stringify(body.answers) : '[]';
+      const points = correct * 10; // 10 نقاط لكل سؤال صحيح (تتراكم دائماً)
 
-      // 1. تسجيل النتيجة في جدول results
+      // استخراج القسم والمادة والرمز صراحة
+      const { category, subject, model } = parseQuizId(rawQuizId);
+
+      // 1. تسجيل المحاولة في جدول النتائج التراكمي (results) لضمان تراكم النقاط والأسئلة والنسبة
       await env.DB.prepare(`
-        INSERT INTO results (user_id, quiz_id, score, total, percentage, answers, time_spent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(user.id, quizId, correct, total, percentage, answers, duration).run();
+        INSERT INTO results (user_id, quiz_id, category, subject, model, score, total, percentage, points, time_spent, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      `).bind(user.id, rawQuizId, category, subject, model, correct, total, percentage, points, duration).run();
 
-      // 2. تحديث رصيد النقاط الإجمالي للمستخدم في جدول users مباشرة (10 نقاط لكل سؤال صحيح)
+      // 2. تحديث جدول متابعة النماذج (user_quiz_progress) لضمان حفظ الزمن الأقصر عند الإعادة
+      await env.DB.prepare(`
+        INSERT INTO user_quiz_progress (
+          user_id, quiz_id, category, subject, model,
+          best_score, total, best_percentage, shortest_time, last_time, attempts_count,
+          last_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now'))
+        ON CONFLICT(user_id, quiz_id) DO UPDATE SET
+          best_score = MAX(user_quiz_progress.best_score, excluded.best_score),
+          total = excluded.total,
+          best_percentage = MAX(user_quiz_progress.best_percentage, excluded.best_percentage),
+          shortest_time = CASE
+            WHEN user_quiz_progress.shortest_time <= 0 THEN excluded.shortest_time
+            WHEN excluded.shortest_time <= 0 THEN user_quiz_progress.shortest_time
+            ELSE MIN(user_quiz_progress.shortest_time, excluded.shortest_time)
+          END,
+          last_time = excluded.last_time,
+          attempts_count = user_quiz_progress.attempts_count + 1,
+          last_attempt_at = datetime('now'),
+          updated_at = datetime('now')
+      `).bind(user.id, rawQuizId, category, subject, model, correct, total, percentage, duration, duration).run();
+
+      // 3. تحديث مجموع النقاط التراكمية في جدول users فوراً
       await env.DB.prepare(`
         UPDATE users 
-        SET score = (SELECT COALESCE(SUM(score * 10), 0) FROM results WHERE user_id = ?)
+        SET score = (SELECT COALESCE(SUM(points), 0) FROM results WHERE user_id = ?),
+            updated_at = datetime('now')
         WHERE id = ?
       `).bind(user.id, user.id).run();
 
+      // جلب الزمن الأقصر المحقق لهذا النموذج لتقديمه في الاستجابة
+      const progressRecord = await env.DB.prepare(
+        'SELECT shortest_time, attempts_count FROM user_quiz_progress WHERE user_id = ? AND quiz_id = ?'
+      ).bind(user.id, rawQuizId).first();
+
       return successResponse({ 
-        message: 'تم حفظ كافة بيانات النموذج وتحديث الإحصائيات بنجاح',
+        message: 'تم حفظ النتيجة وتحديث الإحصائيات التراكمية والزمن الأقصر بنجاح',
         saved: {
-          quiz_id: quizId,
+          quiz_id: rawQuizId,
+          category,
+          subject,
+          model,
+          points_earned: points,
           correct_answers: correct,
           total_questions: total,
-          percentage,
-          duration_seconds: duration
+          duration_seconds: duration,
+          shortest_time_seconds: progressRecord?.shortest_time || duration,
+          attempts_count: progressRecord?.attempts_count || 1
         }
       });
     } catch (e) {
@@ -605,35 +695,42 @@ async function handleUserStats(request, env) {
     }
   }
 
-  // GET: جلب كافة الإحصائيات المحسوبة من قاعدة البيانات مباشرة
+  // GET: جلب الإحصائيات التراكمية الكلية وتفصيل كل قسم تعليمي بدقة تامة
   if (request.method === 'GET') {
     try {
-      // 1. الإحصائيات التراكمية الكلية للمستخدم
+      // 1. الإحصائيات التراكمية الشاملة عبر جميع المحاولات
       const statsStmt = await env.DB.prepare(`
         SELECT 
-          COUNT(*) as total_quizzes,
+          COUNT(id) as total_quizzes,
           COALESCE(SUM(total), 0) as total_questions,
           COALESCE(SUM(score), 0) as total_correct,
-          COALESCE(AVG(percentage), 0) as avg_accuracy,
-          COALESCE(SUM(score * 10), 0) as total_score,
+          CASE 
+            WHEN SUM(total) > 0 THEN ROUND((CAST(SUM(score) AS REAL) / SUM(total)) * 100)
+            ELSE 0 
+          END as avg_accuracy,
+          COALESCE(SUM(points), 0) as total_score,
           COALESCE(SUM(time_spent), 0) as total_duration
         FROM results 
         WHERE user_id = ?
       `).bind(user.id);
       const stats = await statsStmt.first();
 
-      // 2. تفصيل كل قسم تعليمي (عدد النماذج، الأسئلة، الدقة، والوقت)
+      // 2. تجميع إحصائيات الأقسام التعليمية بالاعتماد على عمود category الصريح
       const catStmt = await env.DB.prepare(`
         SELECT 
-          quiz_id, 
-          COUNT(*) as quizzes_count, 
+          category, 
+          COUNT(id) as quizzes_count, 
           SUM(total) as total_questions,
           SUM(score) as total_correct,
-          AVG(percentage) as avg_accuracy,
+          CASE 
+            WHEN SUM(total) > 0 THEN ROUND((CAST(SUM(score) AS REAL) / SUM(total)) * 100)
+            ELSE 0 
+          END as avg_accuracy,
+          SUM(points) as total_points,
           SUM(time_spent) as total_duration
         FROM results
         WHERE user_id = ?
-        GROUP BY quiz_id
+        GROUP BY category
       `).bind(user.id);
       const catResults = await catStmt.all();
 
@@ -649,42 +746,20 @@ async function handleUserStats(request, env) {
         general: 'عام'
       };
 
-      const grouped = {};
-      catResults.results.forEach(c => {
-        const singleWordKey = (c.quiz_id || '').split('_')[0] || 'general';
-        const rootName = labelMap[singleWordKey] || singleWordKey;
-
-        if (!grouped[singleWordKey]) {
-          grouped[singleWordKey] = {
-            id: singleWordKey,
-            name: rootName,
-            quizzes_count: 0,
-            total_questions: 0,
-            correct_answers: 0,
-            total_score_sum: 0,
-            duration_seconds: 0
-          };
-        }
-        grouped[singleWordKey].quizzes_count += c.quizzes_count;
-        grouped[singleWordKey].total_questions += c.total_questions;
-        grouped[singleWordKey].correct_answers += c.total_correct;
-        grouped[singleWordKey].total_score_sum += (c.avg_accuracy * c.quizzes_count);
-        grouped[singleWordKey].duration_seconds += (c.total_duration || 0);
-      });
-
-      const categories = Object.values(grouped).map(g => ({
-        id: g.id,
-        name: g.name,
-        progress: Math.round(g.quizzes_count > 0 ? (g.total_score_sum / g.quizzes_count) : 0),
-        quizzes: g.quizzes_count,
-        questions: g.total_questions,
-        correct: g.correct_answers,
-        duration: g.duration_seconds
+      const categories = (catResults.results || []).map(c => ({
+        id: c.category,
+        name: labelMap[c.category] || c.category,
+        progress: c.avg_accuracy,
+        quizzes: c.quizzes_count,
+        questions: c.total_questions,
+        correct: c.total_correct,
+        points: c.total_points,
+        duration: c.total_duration
       }));
 
-      // 3. أحدث النماذج التي خاضها الطالب مع نتيجتها ووقتها
+      // 3. أحدث المحاولات المنجزة
       const recentStmt = await env.DB.prepare(`
-        SELECT id, quiz_id, score as correct_answers, total as total_questions, percentage as accuracy, time_spent as duration_seconds, created_at
+        SELECT id, quiz_id, category, subject, model, score as correct_answers, total as total_questions, percentage as accuracy, points, time_spent as duration_seconds, created_at
         FROM results
         WHERE user_id = ?
         ORDER BY created_at DESC
@@ -693,13 +768,13 @@ async function handleUserStats(request, env) {
       const recent = await recentStmt.all();
 
       return successResponse({
-        total_quizzes: stats?.total_quizzes || 0,        // إجمالي الاختبارات المكتملة
-        total_questions: stats?.total_questions || 0,    // إجمالي الأسئلة المحلولة
-        correct_answers: stats?.total_correct || 0,      // إجمالي الإجابات الصحيحة
-        accuracy: Math.round(stats?.avg_accuracy || 0),  // نسبة الدقة الإجمالية
-        total_score: stats?.total_score || 0,            // مجموع النقاط التراكمية
-        total_duration: stats?.total_duration || 0,      // إجمالي وقت الحل بالثواني
-        total_answers: stats?.total_questions || 0,      // للتوافق العكسي مع الواجهات السابقة
+        total_quizzes: stats?.total_quizzes || 0,
+        total_questions: stats?.total_questions || 0,
+        correct_answers: stats?.total_correct || 0,
+        accuracy: Math.round(stats?.avg_accuracy || 0),
+        total_score: stats?.total_score || 0,
+        total_duration: stats?.total_duration || 0,
+        total_answers: stats?.total_questions || 0,
         categories,
         recent_quizzes: recent.results
       });
@@ -711,7 +786,7 @@ async function handleUserStats(request, env) {
   return errorResponse('طريقة غير مدعومة', 405);
 }
 
-// نظام المتابعة الشامل
+// نظام المتابعات المتبادلة
 async function handleFollow(request, env, explicitTargetId = null) {
   const token = getAuthToken(request);
   if (!token) return errorResponse('غير مصرح', 401);
@@ -793,7 +868,7 @@ async function handleUserFollowing(request, env) {
 async function handleFollowersList(request, env, userId) {
   try {
     const stmt = await env.DB.prepare(`
-      SELECT u.id, u.username, u.full_name, u.avatar, u.badge, u.is_admin
+      SELECT u.id, u.username, u.full_name, u.avatar, u.is_admin
       FROM users u
       JOIN follows f ON u.id = f.follower_id
       WHERE f.following_id = ? AND (u.deleted_at IS NULL OR u.deleted_at = "")
@@ -810,7 +885,7 @@ async function handleFollowersList(request, env, userId) {
 async function handleFollowingList(request, env, userId) {
   try {
     const stmt = await env.DB.prepare(`
-      SELECT u.id, u.username, u.full_name, u.avatar, u.badge, u.is_admin
+      SELECT u.id, u.username, u.full_name, u.avatar, u.is_admin
       FROM users u
       JOIN follows f ON u.id = f.following_id
       WHERE f.follower_id = ? AND (u.deleted_at IS NULL OR u.deleted_at = "")
@@ -825,13 +900,13 @@ async function handleFollowingList(request, env, userId) {
 }
 
 // ================================================================
-//  PART 3: إدارة بنك الأسئلة (يدعم model_id عبر JOIN مع metadata)
+//  PART 4: إدارة بنك الأسئلة
 // ================================================================
 
 async function handleQuestions(request, env) {
   const url = new URL(request.url);
 
-  // POST: رفع سؤال جديد
+  // POST: رفع سؤال جديد بواسطة المشرف
   if (request.method === 'POST') {
     const token = getAuthToken(request);
     if (!token) return errorResponse('غير مصرح', 401);
@@ -898,14 +973,14 @@ async function handleQuestions(request, env) {
       if (existing) {
         await env.DB.prepare(`
           UPDATE questions 
-          SET text = ?, options = ?, correct = ?, explanation = ?, image = COALESCE(?, image)
+          SET text = ?, options = ?, correct = ?, explanation = ?, image = COALESCE(?, image), updated_at = datetime('now')
           WHERE id = ?
         `).bind(text, JSON.stringify(options), correct, explanation || null, imageUrl, existing.id).run();
         qId = existing.id;
       } else {
         await env.DB.prepare(`
-          INSERT INTO questions (category, subject, model_id, question_number, text, options, correct, explanation, image, created_by, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          INSERT INTO questions (category, subject, model_id, question_number, text, options, correct, explanation, image, created_by, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
         `).bind(
           category, subject, modelId, question_number || 0,
           text, JSON.stringify(options), correct,
@@ -920,7 +995,7 @@ async function handleQuestions(request, env) {
     } catch (e) {
       return errorResponse(e.message);
     }
-          }
+}
   
   // GET: جلب أسئلة الاختبار
   if (request.method === 'GET') {
@@ -949,7 +1024,7 @@ async function handleQuestions(request, env) {
         const stmt = await env.DB.prepare(mixedQuery).bind(...mixedParams);
         const questions = await stmt.all();
 
-        const processed = questions.results.map(q => {
+        const processed = (questions.results || []).map(q => {
           let opts = q.options;
           if (typeof opts === 'string') {
             try { opts = JSON.parse(opts); } catch (e) { opts = []; }
@@ -964,12 +1039,10 @@ async function handleQuestions(request, env) {
     }
 
     if (!category && quizId) {
-      const parts = quizId.split('_');
-      if (parts.length >= 3) {
-        category = parts[0];
-        subject = parts[1];
-        model = parts.slice(2).join('_');
-      }
+      const parsed = parseQuizId(quizId);
+      category = parsed.category;
+      subject = parsed.subject;
+      model = parsed.model;
     }
 
     if (!category || !subject) {
@@ -988,7 +1061,7 @@ async function handleQuestions(request, env) {
       `;
       const params = [category, subject];
 
-      if (model && model !== 'random') {
+      if (model && model !== 'random' && model !== 'general') {
         query += ' AND m.model = ? ORDER BY q.question_number ASC';
         params.push(model);
       } else {
@@ -998,7 +1071,7 @@ async function handleQuestions(request, env) {
       const stmt = await env.DB.prepare(query).bind(...params);
       const questions = await stmt.all();
 
-      const processed = questions.results.map(q => {
+      const processed = (questions.results || []).map(q => {
         let opts = q.options;
         if (typeof opts === 'string') {
           try { opts = JSON.parse(opts); } catch (e) { opts = []; }
@@ -1128,7 +1201,7 @@ async function handleQuestionFullUpdate(request, env, id) {
     let updateQuery = `
       UPDATE questions 
       SET category = ?, subject = ?, model_id = ?, question_number = ?, 
-          text = ?, options = ?, correct = ?, explanation = ?
+          text = ?, options = ?, correct = ?, explanation = ?, updated_at = datetime('now')
     `;
     const params = [category, subject, modelId, question_number, text, JSON.stringify(options), correct, explanation || null];
 
@@ -1173,7 +1246,7 @@ async function handleQuestionDelete(request, env, id) {
     if (!existing) return errorResponse('السؤال غير موجود أو تم حذفه مسبقاً', 404);
 
     await env.DB.prepare(
-      'UPDATE questions SET deleted_at = datetime("now") WHERE id = ?'
+      'UPDATE questions SET deleted_at = datetime("now"), updated_at = datetime("now") WHERE id = ?'
     ).bind(existing.id).run();
 
     return successResponse({ message: 'تم حذف السؤال بنجاح' });
@@ -1183,7 +1256,7 @@ async function handleQuestionDelete(request, env, id) {
 }
 
 // ================================================================
-//  PART 4: المجتمع، التفاعل والمتصدرين المحدثين
+//  PART 5: المجتمع، المنشورات، التفاعل، والليدربورد التراكمي
 // ================================================================
 
 async function handlePosts(request, env) {
@@ -1227,8 +1300,8 @@ async function handlePosts(request, env) {
       }
 
       await env.DB.prepare(`
-        INSERT INTO posts (user_id, title, content, category, image, created_at)
-        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO posts (user_id, title, content, category, image, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
       `).bind(user.id, title, content, category, imageUrl).run();
 
       return successResponse({ message: 'تم نشر المنشور بنجاح' });
@@ -1246,12 +1319,13 @@ async function handlePosts(request, env) {
       let query = `
         SELECT 
           p.id, p.title, p.content, p.category, p.image, p.created_at,
-          u.id as user_id, u.full_name, u.username, u.avatar, u.badge, u.is_admin,
+          u.id as user_id, u.full_name, u.username, u.avatar, u.is_admin,
           (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id = p.id) as likes_count,
-          (SELECT COUNT(*) FROM post_comments pc WHERE pc.post_id = p.id) as comments_count
+          (SELECT COUNT(*) FROM post_comments pc WHERE pc.post_id = p.id AND (pc.deleted_at IS NULL OR pc.deleted_at = "")) as comments_count
         FROM posts p
         JOIN users u ON p.user_id = u.id
         WHERE (u.deleted_at IS NULL OR u.deleted_at = "")
+          AND (p.deleted_at IS NULL OR p.deleted_at = "")
       `;
       const params = [];
 
@@ -1269,10 +1343,10 @@ async function handlePosts(request, env) {
       if (currentUser) {
         const likesStmt = await env.DB.prepare('SELECT post_id FROM post_likes WHERE user_id = ?').bind(currentUser.id);
         const userLikes = await likesStmt.all();
-        userLikedSet = new Set(userLikes.results.map(l => l.post_id));
+        userLikedSet = new Set((userLikes.results || []).map(l => l.post_id));
       }
 
-      const list = posts.results.map(p => ({
+      const list = (posts.results || []).map(p => ({
         ...p,
         is_admin: p.is_admin === 1 || p.is_admin === true || p.is_admin === '1',
         is_liked: userLikedSet.has(p.id)
@@ -1326,7 +1400,7 @@ async function handlePostLikers(request, env, postId) {
 
   try {
     const stmt = await env.DB.prepare(`
-      SELECT u.id, u.username, u.full_name, u.avatar, u.badge, u.is_admin
+      SELECT u.id, u.username, u.full_name, u.avatar, u.is_admin
       FROM users u
       JOIN post_likes pl ON u.id = pl.user_id
       WHERE pl.post_id = ? AND (u.deleted_at IS NULL OR u.deleted_at = "")
@@ -1334,7 +1408,7 @@ async function handlePostLikers(request, env, postId) {
     `).bind(pId);
     const result = await stmt.all();
 
-    const users = result.results.map(u => ({
+    const users = (result.results || []).map(u => ({
       ...u,
       is_admin: u.is_admin === 1 || u.is_admin === true || u.is_admin === '1'
     }));
@@ -1357,12 +1431,14 @@ async function handlePostComments(request, env, postId) {
           u.id as user_id, u.username, u.full_name, u.avatar, u.is_admin
         FROM post_comments c
         JOIN users u ON c.user_id = u.id
-        WHERE c.post_id = ? AND (u.deleted_at IS NULL OR u.deleted_at = "")
+        WHERE c.post_id = ? 
+          AND (u.deleted_at IS NULL OR u.deleted_at = "")
+          AND (c.deleted_at IS NULL OR c.deleted_at = "")
         ORDER BY c.created_at ASC
       `).bind(pId);
       const comments = await stmt.all();
 
-      const list = comments.results.map(c => ({
+      const list = (comments.results || []).map(c => ({
         ...c,
         is_admin: c.is_admin === 1 || c.is_admin === true || c.is_admin === '1'
       }));
@@ -1397,101 +1473,62 @@ async function handlePostComments(request, env, postId) {
   }
 
   return errorResponse('طريقة غير مدعومة', 405);
-}
-
-async function handleResults(request, env) {
-  const token = getAuthToken(request);
-  if (!token) return errorResponse('غير مصرح', 401);
-  const user = await verifyToken(token, env);
-  if (!user) return errorResponse('توكن غير صالح', 401);
-
-  if (request.method === 'POST') {
-    try {
-      const body = await request.json();
-      const { quiz_id, score, total, percentage, answers, time_spent } = body;
-
-      await env.DB.prepare(`
-        INSERT INTO results (user_id, quiz_id, score, total, percentage, answers, time_spent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(user.id, quiz_id, score, total, percentage, JSON.stringify(answers || []), time_spent || null).run();
-
-      return successResponse({ message: 'تم حفظ النتيجة' });
-    } catch (e) {
-      return errorResponse(e.message);
-    }
-  }
-
-  if (request.method === 'GET') {
-    try {
-      const stmt = await env.DB.prepare(`
-        SELECT id, quiz_id, score, total, percentage, answers, time_spent, created_at
-        FROM results 
-        WHERE user_id = ? 
-        ORDER BY created_at DESC
-      `).bind(user.id);
-      const results = await stmt.all();
-      return successResponse({ results: results.results });
-    } catch (e) {
-      return errorResponse(e.message);
-    }
-      }
-  return errorResponse('طريقة غير مدعومة', 405);
-}
-
-/**
- * ================================================================
- *  لوحة المتصدرين الشاملة والمحدثة بالكامل مع كافة البيانات الحقيقية
- * ================================================================
- */
+          }
+// لوحة المتصدرين الشاملة مع احتساب النقاط التراكمية ونسبة الدقة المتراكمة الحقيقية
 async function handleLeaderboard(request, env) {
   const url = new URL(request.url);
   const category = url.searchParams.get('category');
 
   try {
-    let query = `
-      SELECT u.id, u.username, u.full_name, u.badge, u.avatar, u.is_admin,
-             COUNT(r.id) as total_quizzes,
-             COALESCE(SUM(r.total), 0) as total_questions,
-             COALESCE(SUM(r.score), 0) as total_correct,
-             COALESCE(SUM(r.score * 10), 0) as total_points,
-             COALESCE(AVG(r.percentage), 0) as avg_accuracy,
-             COALESCE(SUM(r.time_spent), 0) as total_duration
-      FROM users u
-      LEFT JOIN results r ON u.id = r.user_id
-      WHERE (u.deleted_at IS NULL OR u.deleted_at = "")
-    `;
+    let joinCondition = 'u.id = r.user_id';
     const params = [];
 
     if (category && category !== 'all') {
       if (category === 'olympiad') {
-        query += ` AND (r.quiz_id LIKE 'olympiad%' OR r.quiz_id LIKE 'juniors%' OR r.quiz_id LIKE 'youth%' OR r.quiz_id LIKE 'grade10%')`;
+        joinCondition += " AND (r.category IN ('olympiad', 'juniors', 'youth', 'grade10') OR r.quiz_id LIKE 'olympiad%' OR r.quiz_id LIKE 'juniors%' OR r.quiz_id LIKE 'youth%' OR r.quiz_id LIKE 'grade10%')";
       } else if (category === 'outstanding') {
-        query += ` AND (r.quiz_id LIKE 'outstanding%' OR r.quiz_id LIKE 'outstanding7%' OR r.quiz_id LIKE 'outstanding10%')`;
+        joinCondition += " AND (r.category IN ('outstanding', 'outstanding7', 'outstanding10') OR r.quiz_id LIKE 'outstanding%' OR r.quiz_id LIKE 'outstanding7%' OR r.quiz_id LIKE 'outstanding10%')";
       } else {
-        query += ` AND r.quiz_id LIKE ?`;
-        params.push(`${category}%`);
+        joinCondition += " AND (r.category = ? OR r.quiz_id LIKE ?)";
+        params.push(category, `${category}%`);
       }
     }
 
-    query += ` GROUP BY u.id HAVING total_quizzes > 0 ORDER BY total_points DESC, avg_accuracy DESC LIMIT 100`;
+    const query = `
+      SELECT u.id, u.username, u.full_name, u.avatar, u.is_admin,
+             COUNT(r.id) as total_quizzes,
+             COALESCE(SUM(r.total), 0) as total_questions,
+             COALESCE(SUM(r.score), 0) as total_correct,
+             COALESCE(SUM(r.points), 0) as total_points,
+             CASE 
+               WHEN SUM(r.total) > 0 THEN ROUND((CAST(SUM(r.score) AS REAL) / SUM(r.total)) * 100)
+               ELSE 0 
+             END as avg_accuracy,
+             COALESCE(SUM(r.time_spent), 0) as total_duration
+      FROM users u
+      INNER JOIN results r ON ${joinCondition}
+      WHERE (u.deleted_at IS NULL OR u.deleted_at = "")
+      GROUP BY u.id, u.username, u.full_name, u.avatar, u.is_admin
+      HAVING total_quizzes > 0
+      ORDER BY total_points DESC, avg_accuracy DESC
+      LIMIT 100
+    `;
 
     const stmt = await env.DB.prepare(query).bind(...params);
     const data = await stmt.all();
 
-    // إرجاع كل الحقول المحسوبة من قاعدة البيانات بدون أي أصفار مصطنعة
-    const leaderboard = data.results.map(u => ({
+    const leaderboard = (data.results || []).map(u => ({
       id: u.id,
       username: u.username,
       full_name: u.full_name,
-      badge: u.badge || 'none',
       avatar: u.avatar || null,
       is_admin: u.is_admin === 1 || u.is_admin === true || u.is_admin === '1',
-      score: Math.round(u.total_points || 0),           // إجمالي النقاط (10 نقاط لكل سؤال صحيح)
-      total_quizzes: u.total_quizzes || 0,             // عدد الاختبارات المنجزة
-      total_questions: u.total_questions || 0,         // إجمالي الأسئلة التي خاضها
-      correct_answers: u.total_correct || 0,           // مجموع الإجابات الصحيحة
-      accuracy: Math.round(u.avg_accuracy || 0),       // متوسط نسبة الدقة
-      duration_seconds: u.total_duration || 0          // إجمالي الوقت المستغرق بالثواني
+      score: Math.round(u.total_points || 0),
+      total_quizzes: u.total_quizzes || 0,
+      total_questions: u.total_questions || 0,
+      correct_answers: u.total_correct || 0,
+      accuracy: Math.round(u.avg_accuracy || 0),
+      duration_seconds: u.total_duration || 0
     }));
 
     return successResponse({ leaderboard });
@@ -1524,13 +1561,15 @@ async function handleSearch(request, env) {
       SELECT p.id, p.title, p.content, p.category, u.full_name, u.username, u.avatar
       FROM posts p
       JOIN users u ON p.user_id = u.id
-      WHERE (p.title LIKE ? OR p.content LIKE ?) AND (u.deleted_at IS NULL OR u.deleted_at = "")
+      WHERE (p.title LIKE ? OR p.content LIKE ?) 
+        AND (u.deleted_at IS NULL OR u.deleted_at = "")
+        AND (p.deleted_at IS NULL OR p.deleted_at = "")
       LIMIT 10
     `).bind(searchTerm, searchTerm);
     const posts = await pStmt.all();
 
     const uStmt = await env.DB.prepare(`
-      SELECT id, username, full_name, badge, avatar, is_admin
+      SELECT id, username, full_name, avatar, is_admin
       FROM users
       WHERE (username LIKE ? OR full_name LIKE ?) AND (deleted_at IS NULL OR deleted_at = "")
       LIMIT 10
@@ -1538,15 +1577,15 @@ async function handleSearch(request, env) {
     const users = await uStmt.all();
 
     return successResponse({
-      questions: questions.results.map(q => {
+      questions: (questions.results || []).map(q => {
         let opts = q.options;
         if (typeof opts === 'string') {
           try { opts = JSON.parse(opts); } catch (e) { opts = []; }
         }
         return { ...q, options: opts };
       }),
-      posts: posts.results,
-      users: users.results.map(u => ({ ...u, is_admin: u.is_admin === 1 }))
+      posts: posts.results || [],
+      users: (users.results || []).map(u => ({ ...u, is_admin: u.is_admin === 1 }))
     });
   } catch (e) {
     return errorResponse(e.message);
@@ -1554,7 +1593,7 @@ async function handleSearch(request, env) {
 }
 
 // ================================================================
-//  PART 5: البيانات الوصفية (Metadata)
+//  PART 6: إدارة البيانات الوصفية والنماذج (Metadata)
 // ================================================================
 
 async function handleMetadata(request, env) {
@@ -1583,7 +1622,7 @@ async function handleMetadata(request, env) {
     const result = await stmt.all();
 
     const data = {};
-    result.results.forEach(row => {
+    (result.results || []).forEach(row => {
       if (!data[row.subject]) data[row.subject] = [];
       data[row.subject].push({
         model: row.model,
@@ -1597,7 +1636,7 @@ async function handleMetadata(request, env) {
       models: data[key]
     }));
 
-    return successResponse({ subjects, metadata: result.results });
+    return successResponse({ subjects, metadata: result.results || [] });
   } catch (e) {
     return errorResponse(e.message);
   }
@@ -1633,7 +1672,7 @@ async function handleMetadataManagement(request, env) {
       await env.DB.prepare(`
         INSERT INTO metadata (category, subject, model, display_name, icon_class, sort_order)
         VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM metadata WHERE category = ? AND subject = ?))
-      `).bind(category, subject, model, display_name, icon_class || null, category, subject).run();
+      `).bind(category, subject, model, display_name, icon_class || 'fas fa-file-alt', category, subject).run();
 
       return successResponse({
         message: 'تم إضافة النموذج بنجاح',
@@ -1660,7 +1699,7 @@ async function handleMetadataManagement(request, env) {
 }
 
 // ================================================================
-//  PART 6: الموجه العام للطلبات (Main Router)
+//  PART 7: الموجه الرئيسي (Main Fetch Router)
 // ================================================================
 
 export default {
@@ -1726,7 +1765,7 @@ export default {
         return await handleQuestionDelete(request, env, decodeURIComponent(id));
       }
 
-      // 3. مسارات المنشورات والتفاعل المجتمعي
+      // 3. مسارات المجتمع والمنشورات
       if (path.match(/^\/api\/posts\/(\d+)\/like$/) && method === 'POST') {
         const postId = path.split('/')[3];
         return await handlePostLike(request, env, postId);
@@ -1741,16 +1780,18 @@ export default {
       }
       if (path === '/api/posts') return await handlePosts(request, env);
 
-      // 4. مسارات النتائج، لوحة المتصدرين والبحث
-      if (path === '/api/results') return await handleResults(request, env);
+      // 4. مسار النتائج التوافقي ولوحة المتصدرين والبحث
+      if (path === '/api/results' && (method === 'GET' || method === 'POST')) {
+        return await handleUserStats(request, env);
+      }
       if (path === '/api/leaderboard' && method === 'GET') return await handleLeaderboard(request, env);
       if (path === '/api/search' && method === 'GET') return await handleSearch(request, env);
 
-      // 5. البيانات الوصفية (Metadata)
+      // 5. مسارات البيانات الوصفية (Metadata)
       if (path === '/api/metadata' && method === 'GET') return await handleMetadata(request, env);
       if (path === '/api/metadata/manage') return await handleMetadataManagement(request, env);
 
-      // 6. جلب الصور المرفوعة من KV
+      // 6. استرجاع الصور المخزنة في KV
       if (path.startsWith('/api/images/')) {
         const key = path.replace('/api/images/', '');
         if (!env.IMAGES) return errorResponse('تخزين الصور غير متوفر', 503);
